@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1 - 2026-08-29
+
+- Added a centralized, risk-triggered subagent model profile.
+- Set the delegated subagent default to `gpt-5.6-luna` with `max` reasoning effort.
+- Preserved direct execution for simple work and allowed explicit user overrides or reported availability fallback.
+
 ## 0.4.0 - 2026-08-28
 
 - Added Git baseline capture at init and automatic task-diff calculation in `set-changes`.

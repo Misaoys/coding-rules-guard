@@ -56,6 +56,9 @@
     "gaps_authorized": { "type": "boolean" },
     "rework_count": { "type": "integer", "minimum": 0 },
     "last_rework_reason": { "type": ["string", "null"] },
+    "rework_streak": { "type": "integer", "minimum": 0 },
+    "replan_required": { "type": "boolean" },
+    "plan_revision": { "type": "integer", "minimum": 1 },
     "delivery_audit": {
       "type": ["object", "null"],
       "properties": {

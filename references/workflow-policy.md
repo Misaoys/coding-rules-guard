@@ -27,4 +27,4 @@
 
 ## 阶段
 
-正常路径是 `plan → implement → verify → complete`；只有需要 Git、安装、发布、版本核对或正式交付时走 `verify → deliver → complete`。Verify 确认实现缺陷后，先记录失败证据，再执行 `guard.py rework --reason <原因>` 返回 Implement；该命令会把结果重置为 pending，清除已失效证据、GAP 授权和交付审计，并保留返工次数与原因。普通 `transition` 不允许任意倒退。状态文件放在任务临时目录，不写入或暂存到业务仓库。
+正常路径是 `plan → implement → verify → complete`；只有需要 Git、安装、发布、版本核对或正式交付时走 `verify → deliver → complete`。Verify 确认实现缺陷后，先记录失败证据，再执行 `guard.py rework --reason <原因>`。第一次返回 Implement；同一 Plan 第二次连续返工返回 `REPLAN_RECOMMENDED` 警告；第三次返回 Plan 并设置 `REPLAN_REQUIRED`，此时普通 transition 不能重新进入 Implement，必须用 `guard.py revise-plan` 更新模式、目标、WRITE 和风险。修订 Plan 或成功完成 Verify 后 `rework_streak` 归零，累计 `rework_count` 不清零。状态文件放在任务临时目录，不写入或暂存到业务仓库。

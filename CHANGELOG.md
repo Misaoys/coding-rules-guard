@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 - 2026-08-28
+
+- Added a consecutive rework streak with a warning on the second attempt.
+- Forced the third consecutive rework back to Plan with an unskippable `replan_required` gate.
+- Added `revise-plan` to replace the hypothesis, mode, write scope, and risk before implementation resumes.
+- Blocked revised Plans that would orphan existing changed files outside the new write scope.
+- Reset only the consecutive streak after a revised Plan or successful verification while preserving lifetime rework count.
+
 ## 0.2.1 - 2026-08-28
 
 - Added a guarded Verify-to-Implement rework loop.

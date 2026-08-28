@@ -18,6 +18,8 @@ PHASES = {"plan", "implement", "verify", "deliver", "complete"}
 IMPACTS = {"no_known_impact", "known_impact", "unverified"}
 RESULTS = {"pending", "pass", "pass_with_gaps", "blocked", "fail"}
 LEVELS = {"source", "test", "browser", "installed", "host", "production"}
+REWORK_WARN_AT = 2
+REWORK_REPLAN_AT = 3
 SECRET_NAME_PATTERNS = (".env", "*.pem", "*.p12", "*.pfx", "id_rsa", "id_ed25519")
 SECRET_CONTENT = re.compile(
     r"(?:-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|"
@@ -85,6 +87,14 @@ def validate_shape(state: dict[str, Any]) -> None:
     rework_reason = state.get("last_rework_reason")
     if rework_reason is not None and (not isinstance(rework_reason, str) or not rework_reason.strip()):
         errors.append("last_rework_reason must be null or a non-empty string")
+    rework_streak = state.get("rework_streak", 0)
+    if not isinstance(rework_streak, int) or isinstance(rework_streak, bool) or rework_streak < 0:
+        errors.append("rework_streak must be a non-negative integer")
+    plan_revision = state.get("plan_revision", 1)
+    if not isinstance(plan_revision, int) or isinstance(plan_revision, bool) or plan_revision < 1:
+        errors.append("plan_revision must be a positive integer")
+    if not isinstance(state.get("replan_required", False), bool):
+        errors.append("replan_required must be a boolean")
     for key in ("write_scope", "changed_files", "evidence", "gaps"):
         if not isinstance(state.get(key), list):
             errors.append(f"{key} must be an array")
@@ -159,6 +169,8 @@ def check_transition(state: dict[str, Any], target: str) -> None:
             errors.append("write_scope is empty")
         if state["risk"]["impact"] == "unverified":
             errors.append("risk impact must be assessed before implementation")
+        if state.get("replan_required", False):
+            errors.append("revise-plan is required before implementation")
     elif target == "verify":
         if not state["changed_files"]:
             errors.append("changed_files is empty")
@@ -235,6 +247,9 @@ def command_init(args: argparse.Namespace) -> None:
         "delivery_audit": None,
         "rework_count": 0,
         "last_rework_reason": None,
+        "rework_streak": 0,
+        "replan_required": False,
+        "plan_revision": 1,
     }
     validate_shape(state)
     save_state(args.state, state)
@@ -245,6 +260,8 @@ def command_transition(args: argparse.Namespace) -> None:
     state = load_state(args.state)
     check_transition(state, args.to)
     state["phase"] = args.to
+    if args.to in {"deliver", "complete"}:
+        state["rework_streak"] = 0
     save_state(args.state, state)
     emit({"ok": True, "phase": args.to, "state": str(args.state)})
 
@@ -259,22 +276,70 @@ def command_rework(args: argparse.Namespace) -> None:
     if not reason:
         raise GateError("REWORK_REASON_REQUIRED", ["--reason must be non-empty"])
 
-    state["phase"] = "implement"
     state["result"] = "pending"
     state["evidence"] = []
     state["gaps"] = []
     state["gaps_authorized"] = False
     state["delivery_audit"] = None
     state["rework_count"] = int(state.get("rework_count", 0)) + 1
+    state["rework_streak"] = int(state.get("rework_streak", 0)) + 1
     state["last_rework_reason"] = reason
+    payload: dict[str, Any] = {
+        "ok": True,
+        "result": state["result"],
+        "rework_count": state["rework_count"],
+        "rework_streak": state["rework_streak"],
+        "state": str(args.state),
+    }
+    if state["rework_streak"] >= REWORK_REPLAN_AT:
+        state["phase"] = "plan"
+        state["replan_required"] = True
+        payload["code"] = "REPLAN_REQUIRED"
+    else:
+        state["phase"] = "implement"
+        state["replan_required"] = False
+        if state["rework_streak"] >= REWORK_WARN_AT:
+            payload["warning"] = "REPLAN_RECOMMENDED"
+    payload["phase"] = state["phase"]
+    validate_shape(state)
+    save_state(args.state, state)
+    emit(payload)
+
+
+def command_revise_plan(args: argparse.Namespace) -> None:
+    state = load_state(args.state)
+    if state["phase"] != "plan" or not state.get("replan_required", False):
+        raise GateError("REPLAN_NOT_REQUIRED", ["revise-plan requires a forced replan state"])
+
+    revised_scope = sorted({normalize_path(item) for item in args.write})
+    outside = [path for path in state["changed_files"] if not in_scope(path, revised_scope)]
+    if outside:
+        raise GateError(
+            "REPLAN_SCOPE_CONFLICT",
+            ["existing changes fall outside the revised write scope: " + ", ".join(outside)],
+        )
+
+    state["mode"] = args.mode
+    state["goal"] = args.goal.strip()
+    state["write_scope"] = revised_scope
+    state["risk"] = {"impact": args.impact, "details": args.risk_detail}
+    state["delivery_required"] = args.delivery_required
+    state["result"] = "pending"
+    state["evidence"] = []
+    state["gaps"] = []
+    state["gaps_authorized"] = False
+    state["delivery_audit"] = None
+    state["rework_streak"] = 0
+    state["replan_required"] = False
+    state["plan_revision"] = int(state.get("plan_revision", 1)) + 1
     validate_shape(state)
     save_state(args.state, state)
     emit(
         {
             "ok": True,
             "phase": state["phase"],
-            "result": state["result"],
-            "rework_count": state["rework_count"],
+            "plan_revision": state["plan_revision"],
+            "rework_streak": state["rework_streak"],
             "state": str(args.state),
         }
     )
@@ -369,6 +434,16 @@ def build_parser() -> argparse.ArgumentParser:
     rework.add_argument("--state", type=Path, required=True)
     rework.add_argument("--reason", required=True)
     rework.set_defaults(handler=command_rework)
+
+    revise_plan = subparsers.add_parser("revise-plan", help="replace a plan after the rework limit")
+    revise_plan.add_argument("--state", type=Path, required=True)
+    revise_plan.add_argument("--mode", choices=("FAST", "FULL"), required=True)
+    revise_plan.add_argument("--goal", required=True)
+    revise_plan.add_argument("--write", action="append", default=[], required=True)
+    revise_plan.add_argument("--impact", choices=sorted(IMPACTS), required=True)
+    revise_plan.add_argument("--risk-detail", action="append", default=[])
+    revise_plan.add_argument("--delivery-required", action="store_true")
+    revise_plan.set_defaults(handler=command_revise_plan)
 
     changes = subparsers.add_parser("set-changes", help="record changed files")
     changes.add_argument("--state", type=Path, required=True)

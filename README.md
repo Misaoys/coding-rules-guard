@@ -52,6 +52,25 @@ python scripts/guard.py rework --state .\work\run-state.json --reason "implement
 
 Direct `verify → implement` transitions remain blocked so a failed loop cannot silently discard evidence.
 
+Repeated rework uses a bounded streak:
+
+- First consecutive rework returns to Implement.
+- Second consecutive rework returns `REPLAN_RECOMMENDED`.
+- Third consecutive rework sets `REPLAN_REQUIRED` and returns to Plan.
+- `revise-plan` must replace the mode, goal, write scope, and risk before Implement unlocks.
+- The revised write scope must still contain every existing changed file.
+- A revised Plan or successful verification resets `rework_streak`; lifetime `rework_count` remains auditable.
+
+```powershell
+python scripts/guard.py revise-plan `
+  --state .\work\run-state.json `
+  --mode FULL `
+  --goal "revised hypothesis" `
+  --write src/target.py `
+  --impact known_impact `
+  --risk-detail "hypothesis changed"
+```
+
 ## Evidence boundary
 
 Source inspection, tests, browser checks, installed copies, live hosts, and production are different evidence levels. A lower level must not be reported as a higher one. `pass_with_gaps` can reach delivery only after the gaps are listed and explicitly accepted.

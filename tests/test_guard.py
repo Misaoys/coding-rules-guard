@@ -203,6 +203,94 @@ class GuardCliTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertEqual(json.loads(result.stdout)["code"], "INVALID_TRANSITION")
 
+    def test_rework_streak_warns_then_requires_revised_plan(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = Path(temp_dir) / "state.json"
+            result = self.run_guard(
+                "init", "--state", str(state), "--mode", "FAST", "--goal", "first hypothesis",
+                "--write", "src/a.py", "--impact", "no_known_impact"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            result = self.run_guard("transition", "--state", str(state), "--to", "implement")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            rework_outputs = []
+            for attempt in range(1, 4):
+                commands = [
+                    ("set-changes", "--state", str(state), "--file", "src/a.py"),
+                    ("transition", "--state", str(state), "--to", "verify"),
+                    ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "runtime", "--command", "run", "--observed", f"attempt {attempt} failed", "--level", "test", "--result", "fail"),
+                    ("set-result", "--state", str(state), "--result", "fail"),
+                    ("rework", "--state", str(state), "--reason", f"failed hypothesis {attempt}"),
+                ]
+                for command in commands:
+                    result = self.run_guard(*command)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                rework_outputs.append(json.loads(result.stdout))
+
+            self.assertNotIn("warning", rework_outputs[0])
+            self.assertEqual(rework_outputs[1]["warning"], "REPLAN_RECOMMENDED")
+            self.assertEqual(rework_outputs[2]["code"], "REPLAN_REQUIRED")
+
+            payload = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(payload["phase"], "plan")
+            self.assertEqual(payload["rework_count"], 3)
+            self.assertEqual(payload["rework_streak"], 3)
+            self.assertTrue(payload["replan_required"])
+
+            result = self.run_guard("transition", "--state", str(state), "--to", "implement")
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "TRANSITION_BLOCKED")
+
+            result = self.run_guard(
+                "revise-plan", "--state", str(state), "--mode", "FULL", "--goal", "wrong scope",
+                "--write", "src/b.py", "--impact", "known_impact"
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "REPLAN_SCOPE_CONFLICT")
+
+            result = self.run_guard(
+                "revise-plan", "--state", str(state), "--mode", "FULL", "--goal", "revised hypothesis",
+                "--write", "src/a.py", "--impact", "known_impact", "--risk-detail", "hypothesis changed"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(payload["phase"], "plan")
+            self.assertEqual(payload["plan_revision"], 2)
+            self.assertEqual(payload["rework_count"], 3)
+            self.assertEqual(payload["rework_streak"], 0)
+            self.assertFalse(payload["replan_required"])
+            self.assertEqual(payload["goal"], "revised hypothesis")
+
+            result = self.run_guard("transition", "--state", str(state), "--to", "implement")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_successful_verification_resets_only_the_rework_streak(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = Path(temp_dir) / "state.json"
+            commands = [
+                ("init", "--state", str(state), "--mode", "FAST", "--goal", "repair", "--write", "src/a.py", "--impact", "no_known_impact"),
+                ("transition", "--state", str(state), "--to", "implement"),
+                ("set-changes", "--state", str(state), "--file", "src/a.py"),
+                ("transition", "--state", str(state), "--to", "verify"),
+                ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "runtime", "--command", "run", "--observed", "failed", "--level", "test", "--result", "fail"),
+                ("set-result", "--state", str(state), "--result", "fail"),
+                ("rework", "--state", str(state), "--reason", "implementation defect"),
+                ("set-changes", "--state", str(state), "--file", "src/a.py"),
+                ("transition", "--state", str(state), "--to", "verify"),
+                ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "runtime", "--command", "run", "--observed", "passed", "--level", "test", "--result", "pass"),
+                ("record-evidence", "--state", str(state), "--kind", "boundary", "--entry", "edge", "--command", "run edge", "--observed", "passed", "--level", "test", "--result", "pass"),
+                ("set-result", "--state", str(state), "--result", "pass"),
+                ("transition", "--state", str(state), "--to", "complete"),
+            ]
+            for command in commands:
+                result = self.run_guard(*command)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            payload = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(payload["rework_streak"], 0)
+            self.assertEqual(payload["rework_count"], 1)
+
     def test_delivery_audit_checks_real_git_scope(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

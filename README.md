@@ -9,6 +9,8 @@ Coding Rules Guard is a Codex plugin for risk-routed coding work. It keeps low-r
 - A strict seven-section Plan card for readable scope and acceptance criteria.
 - Risk-based delegation instead of mandatory subagents for every write.
 - Machine-readable run state, write-scope checks, evidence records, and delivery audit.
+- Git-baseline change detection that does not trust Agent-declared file lists.
+- Separate, audited gap authorization with machine-generated time and external actor identity.
 - A guarded `rework` loop that returns failed verification to implementation and invalidates stale evidence.
 - No default or repeated hash checks; hash parity runs once only when artifact identity is an acceptance criterion.
 - Honest impact labels: no known impact, known impact, or unverified impact.
@@ -43,6 +45,22 @@ python -m unittest discover -s tests -v
 
 Run-state files are task artifacts. Keep them in a temporary or task-work directory and do not stage them in the target repository.
 
+Initialize before modifying the repository, then let Git baseline detection discover task changes:
+
+```powershell
+python scripts/guard.py init `
+  --state .\work\run-state.json `
+  --repo . `
+  --mode FAST `
+  --goal "bounded change" `
+  --write src/target.py `
+  --impact no_known_impact
+
+python scripts/guard.py set-changes --state .\work\run-state.json
+```
+
+`set-changes --file ...` is rejected for new v2 states. Pre-existing dirty files are fingerprinted at init: untouched files remain outside the task, while further task edits to them are detected. A changed Git HEAD invalidates the baseline.
+
 When Verify confirms an implementation defect, record the failed evidence and return through the dedicated rework gate:
 
 ```powershell
@@ -74,6 +92,22 @@ python scripts/guard.py revise-plan `
 ## Evidence boundary
 
 Source inspection, tests, browser checks, installed copies, live hosts, and production are different evidence levels. A lower level must not be reported as a higher one. `pass_with_gaps` can reach delivery only after the gaps are listed and explicitly accepted.
+
+Gap approval is a separate command:
+
+```powershell
+python scripts/guard.py set-result `
+  --state .\work\run-state.json `
+  --result pass_with_gaps `
+  --gap "live host unavailable"
+
+python scripts/guard.py authorize-gaps `
+  --state .\work\run-state.json `
+  --authorized-by "user:viola" `
+  --reason "accepted missing live-host evidence"
+```
+
+The authorization record contains an ID, `authorized_by`, machine-generated UTC `authorized_at`, and a reason. The local CLI rejects `agent:` identities. A host that needs cryptographic actor authentication must additionally restrict who can invoke `authorize-gaps`.
 
 ## Development validation
 

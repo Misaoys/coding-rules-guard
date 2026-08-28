@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
 import json
 import re
 import subprocess
 import sys
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
@@ -66,8 +68,9 @@ def validate_shape(state: dict[str, Any]) -> None:
     if not isinstance(state, dict):
         raise GateError("STATE_SCHEMA_INVALID", ["state must be an object"])
     errors: list[str] = []
-    if state.get("schema_version") != 1:
-        errors.append("schema_version must be 1")
+    schema_version = state.get("schema_version")
+    if schema_version not in {1, 2}:
+        errors.append("schema_version must be 1 or 2")
     if state.get("mode") not in {"FAST", "FULL"}:
         errors.append("mode must be FAST or FULL")
     if state.get("phase") not in PHASES:
@@ -95,6 +98,39 @@ def validate_shape(state: dict[str, Any]) -> None:
         errors.append("plan_revision must be a positive integer")
     if not isinstance(state.get("replan_required", False), bool):
         errors.append("replan_required must be a boolean")
+    if schema_version == 2:
+        repo = state.get("repo")
+        baseline = state.get("git_baseline")
+        if not isinstance(repo, str) or not Path(repo).is_absolute():
+            errors.append("repo must be an absolute path")
+        if not isinstance(baseline, dict) or not isinstance(baseline.get("head"), str):
+            errors.append("git_baseline.head is required")
+        elif not isinstance(baseline.get("files"), dict):
+            errors.append("git_baseline.files must be an object")
+        if state.get("change_detection") != "git_baseline":
+            errors.append("change_detection must be git_baseline")
+        authorization = state.get("gap_authorization")
+        if authorization is not None:
+            required_auth = {"authorization_id", "authorized_by", "authorized_at", "reason"}
+            if not isinstance(authorization, dict) or not required_auth.issubset(authorization):
+                errors.append("gap_authorization is incomplete")
+            else:
+                if not isinstance(authorization["authorization_id"], str) or not authorization["authorization_id"].strip():
+                    errors.append("gap_authorization.authorization_id is invalid")
+                if not isinstance(authorization["authorized_by"], str) or not re.fullmatch(
+                    r"(?:user|host):[^\s].*", authorization["authorized_by"]
+                ):
+                    errors.append("gap_authorization.authorized_by is invalid")
+                if not isinstance(authorization["reason"], str) or not authorization["reason"].strip():
+                    errors.append("gap_authorization.reason is invalid")
+                try:
+                    authorized_at = datetime.fromisoformat(authorization["authorized_at"])
+                    if authorized_at.utcoffset() is None:
+                        raise ValueError("timezone required")
+                except (TypeError, ValueError):
+                    errors.append("gap_authorization.authorized_at is invalid")
+        if bool(state.get("gaps_authorized")) != (authorization is not None):
+            errors.append("gaps_authorized must match gap_authorization")
     for key in ("write_scope", "changed_files", "evidence", "gaps"):
         if not isinstance(state.get(key), list):
             errors.append(f"{key} must be an array")
@@ -183,6 +219,9 @@ def check_transition(state: dict[str, Any], target: str) -> None:
             errors.append("verification result must be pass or pass_with_gaps")
         if state["result"] == "pass_with_gaps" and (not state["gaps"] or not state["gaps_authorized"]):
             errors.append("pass_with_gaps requires listed and explicitly authorized gaps")
+        if state.get("schema_version") == 2 and state["result"] == "pass_with_gaps":
+            if not isinstance(state.get("gap_authorization"), dict):
+                errors.append("pass_with_gaps requires a separate gap authorization record")
         if state["risk"]["impact"] == "unverified":
             errors.append("impact remains unverified")
         if target == "deliver" and not state["delivery_required"]:
@@ -204,10 +243,72 @@ def git_lines(repo: Path, *args: str) -> list[str]:
     return [normalize_path(line) for line in result.stdout.splitlines() if line.strip()]
 
 
+def git_bytes(repo: Path, *args: str) -> bytes:
+    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True)
+    if result.returncode != 0:
+        details = result.stderr.decode("utf-8", errors="replace").strip() or "git command failed"
+        raise GateError("GIT_COMMAND_FAILED", [details])
+    return result.stdout
+
+
 def actual_git_files(repo: Path) -> list[str]:
-    files = set(git_lines(repo, "diff", "--name-only", "HEAD"))
+    files = set(git_lines(repo, "diff", "--name-only", "--no-renames", "HEAD"))
     files.update(git_lines(repo, "ls-files", "--others", "--exclude-standard"))
     return sorted(files)
+
+
+def git_repo_root(path: Path) -> Path:
+    resolved = path.resolve()
+    roots = git_lines(resolved, "rev-parse", "--show-toplevel")
+    if not roots:
+        raise GateError("GIT_REPO_REQUIRED", [str(resolved)])
+    return Path(roots[0]).resolve()
+
+
+def git_path_fingerprint(repo: Path, rel: str) -> str:
+    digest = hashlib.sha256()
+    full_path = repo / Path(rel)
+    if full_path.is_symlink():
+        digest.update(b"symlink\0")
+        digest.update(str(full_path.readlink()).encode("utf-8", errors="surrogatepass"))
+    elif full_path.is_file():
+        digest.update(b"file\0")
+        with full_path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    elif full_path.is_dir():
+        digest.update(b"directory\0")
+    else:
+        digest.update(b"missing\0")
+    digest.update(b"\0combined-diff\0")
+    digest.update(git_bytes(repo, "diff", "--binary", "--no-renames", "HEAD", "--", rel))
+    digest.update(b"\0index-diff\0")
+    digest.update(git_bytes(repo, "diff", "--cached", "--binary", "--no-renames", "HEAD", "--", rel))
+    return digest.hexdigest()
+
+
+def capture_git_baseline(repo: Path) -> dict[str, Any]:
+    head = git_lines(repo, "rev-parse", "HEAD")
+    if not head:
+        raise GateError("GIT_HEAD_REQUIRED", [str(repo)])
+    dirty = actual_git_files(repo)
+    return {"head": head[0], "files": {path: git_path_fingerprint(repo, path) for path in dirty}}
+
+
+def task_git_files(state: dict[str, Any]) -> list[str]:
+    repo = Path(state["repo"])
+    current_head = git_lines(repo, "rev-parse", "HEAD")
+    baseline = state["git_baseline"]
+    if not current_head or current_head[0] != baseline["head"]:
+        raise GateError("GIT_BASELINE_MOVED", ["Git HEAD changed after init; start a new run state"])
+    current = set(actual_git_files(repo))
+    candidates = current | set(baseline["files"])
+    changed = [
+        path
+        for path in candidates
+        if git_path_fingerprint(repo, path) != baseline["files"].get(path)
+    ]
+    return sorted(changed)
 
 
 def secret_findings(repo: Path, files: Iterable[str]) -> list[str]:
@@ -230,8 +331,10 @@ def secret_findings(repo: Path, files: Iterable[str]) -> list[str]:
 
 
 def command_init(args: argparse.Namespace) -> None:
+    repo = git_repo_root(args.repo)
+    git_baseline = capture_git_baseline(repo)
     state = {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": args.run_id or str(uuid.uuid4()),
         "mode": args.mode,
         "phase": "plan",
@@ -244,12 +347,16 @@ def command_init(args: argparse.Namespace) -> None:
         "gaps": [],
         "delivery_required": args.delivery_required,
         "gaps_authorized": False,
+        "gap_authorization": None,
         "delivery_audit": None,
         "rework_count": 0,
         "last_rework_reason": None,
         "rework_streak": 0,
         "replan_required": False,
         "plan_revision": 1,
+        "repo": str(repo),
+        "git_baseline": git_baseline,
+        "change_detection": "git_baseline",
     }
     validate_shape(state)
     save_state(args.state, state)
@@ -280,6 +387,7 @@ def command_rework(args: argparse.Namespace) -> None:
     state["evidence"] = []
     state["gaps"] = []
     state["gaps_authorized"] = False
+    state["gap_authorization"] = None
     state["delivery_audit"] = None
     state["rework_count"] = int(state.get("rework_count", 0)) + 1
     state["rework_streak"] = int(state.get("rework_streak", 0)) + 1
@@ -328,6 +436,7 @@ def command_revise_plan(args: argparse.Namespace) -> None:
     state["evidence"] = []
     state["gaps"] = []
     state["gaps_authorized"] = False
+    state["gap_authorization"] = None
     state["delivery_audit"] = None
     state["rework_streak"] = 0
     state["replan_required"] = False
@@ -349,7 +458,14 @@ def command_set_changes(args: argparse.Namespace) -> None:
     state = load_state(args.state)
     if state["phase"] != "implement":
         raise GateError("WRONG_PHASE", ["set-changes requires implement phase"])
-    state["changed_files"] = sorted({normalize_path(item) for item in args.file})
+    if state["schema_version"] == 2:
+        if args.file:
+            raise GateError("DECLARED_CHANGES_FORBIDDEN", ["v2 states derive changes from the Git baseline"])
+        state["changed_files"] = task_git_files(state)
+    else:
+        if not args.file:
+            raise GateError("DECLARED_CHANGES_REQUIRED", ["legacy v1 states require --file"])
+        state["changed_files"] = sorted({normalize_path(item) for item in args.file})
     validate_shape(state)
     save_state(args.state, state)
     emit({"ok": True, "changed_files": state["changed_files"]})
@@ -382,9 +498,35 @@ def command_set_result(args: argparse.Namespace) -> None:
         raise GateError("GAPS_REQUIRED", ["pass_with_gaps requires at least one --gap"])
     state["result"] = args.result
     state["gaps"] = args.gap
-    state["gaps_authorized"] = bool(args.authorize_gaps)
+    state["gaps_authorized"] = False
+    state["gap_authorization"] = None
     save_state(args.state, state)
     emit({"ok": True, "result": state["result"], "gaps_authorized": state["gaps_authorized"]})
+
+
+def command_authorize_gaps(args: argparse.Namespace) -> None:
+    state = load_state(args.state)
+    if state["phase"] != "verify":
+        raise GateError("WRONG_PHASE", ["authorize-gaps requires verify phase"])
+    if state["result"] != "pass_with_gaps" or not state["gaps"]:
+        raise GateError("GAPS_NOT_PENDING", ["set pass_with_gaps and list gaps before authorization"])
+    authorized_by = args.authorized_by.strip()
+    if not re.fullmatch(r"(?:user|host):[^\s].*", authorized_by):
+        raise GateError("INVALID_AUTHORIZER", ["authorized_by must start with user: or host:"])
+    reason = args.reason.strip()
+    if not reason:
+        raise GateError("AUTHORIZATION_REASON_REQUIRED", ["--reason must be non-empty"])
+    authorization = {
+        "authorization_id": str(uuid.uuid4()),
+        "authorized_by": authorized_by,
+        "authorized_at": datetime.now(timezone.utc).isoformat(),
+        "reason": reason,
+    }
+    state["gaps_authorized"] = True
+    state["gap_authorization"] = authorization
+    validate_shape(state)
+    save_state(args.state, state)
+    emit({"ok": True, "gap_authorization": authorization, "state": str(args.state)})
 
 
 def command_audit(args: argparse.Namespace) -> None:
@@ -392,7 +534,12 @@ def command_audit(args: argparse.Namespace) -> None:
     if state["phase"] != "deliver":
         raise GateError("WRONG_PHASE", ["audit requires deliver phase"])
     repo = args.repo.resolve()
-    actual = actual_git_files(repo)
+    if state["schema_version"] == 2:
+        if repo != Path(state["repo"]).resolve():
+            raise GateError("AUDIT_REPO_MISMATCH", [str(repo), state["repo"]])
+        actual = task_git_files(state)
+    else:
+        actual = actual_git_files(repo)
     errors: list[str] = []
     undeclared = [path for path in actual if path not in state["changed_files"]]
     outside = [path for path in actual if not in_scope(path, state["write_scope"])]
@@ -416,6 +563,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     init = subparsers.add_parser("init", help="create a run state")
     init.add_argument("--state", type=Path, required=True)
+    init.add_argument("--repo", type=Path, required=True)
     init.add_argument("--run-id")
     init.add_argument("--mode", choices=("FAST", "FULL"), required=True)
     init.add_argument("--goal", required=True)
@@ -447,7 +595,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     changes = subparsers.add_parser("set-changes", help="record changed files")
     changes.add_argument("--state", type=Path, required=True)
-    changes.add_argument("--file", action="append", default=[], required=True)
+    changes.add_argument("--file", action="append", default=[])
     changes.set_defaults(handler=command_set_changes)
 
     evidence = subparsers.add_parser("record-evidence", help="append an evidence record")
@@ -464,8 +612,13 @@ def build_parser() -> argparse.ArgumentParser:
     result.add_argument("--state", type=Path, required=True)
     result.add_argument("--result", choices=("pass", "pass_with_gaps", "blocked", "fail"), required=True)
     result.add_argument("--gap", action="append", default=[])
-    result.add_argument("--authorize-gaps", action="store_true")
     result.set_defaults(handler=command_set_result)
+
+    authorize = subparsers.add_parser("authorize-gaps", help="record external authorization for verification gaps")
+    authorize.add_argument("--state", type=Path, required=True)
+    authorize.add_argument("--authorized-by", required=True)
+    authorize.add_argument("--reason", required=True)
+    authorize.set_defaults(handler=command_authorize_gaps)
 
     audit = subparsers.add_parser("audit", help="audit Git changes before delivery")
     audit.add_argument("--state", type=Path, required=True)

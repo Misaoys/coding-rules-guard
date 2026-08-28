@@ -25,6 +25,12 @@
 
 写入前评估相关调用方、公共契约、数据和运行时副作用。输出只能使用：`no_known_impact`、`known_impact`、`unverified`，面向用户分别表述为“无已知影响”“已知影响”“影响未验证”。
 
+## 机器信任边界
+
+- 新运行必须在 `guard.py init --repo <仓库>` 记录 Git HEAD 和已有脏文件指纹。`set-changes` 不接收 Agent 声明的文件列表，而是自动计算相对 baseline 的任务差异；未被任务触碰的既有脏文件不计入本任务，任务继续修改既有脏文件则会被识别。
+- baseline 后 Git HEAD 改变时停止并要求新建状态，避免跨提交或切分支掩盖改动。
+- `set-result pass_with_gaps` 只提出缺口，不授权。只有独立的 `authorize-gaps` 能写入机器时间、授权者和原因；Agent 不得把自己声明为用户或宿主。缺少授权记录不能 Complete 或 Deliver。
+
 ## 阶段
 
 正常路径是 `plan → implement → verify → complete`；只有需要 Git、安装、发布、版本核对或正式交付时走 `verify → deliver → complete`。Verify 确认实现缺陷后，先记录失败证据，再执行 `guard.py rework --reason <原因>`。第一次返回 Implement；同一 Plan 第二次连续返工返回 `REPLAN_RECOMMENDED` 警告；第三次返回 Plan 并设置 `REPLAN_REQUIRED`，此时普通 transition 不能重新进入 Implement，必须用 `guard.py revise-plan` 更新模式、目标、WRITE 和风险。修订 Plan 或成功完成 Verify 后 `rework_streak` 归零，累计 `rework_count` 不清零。状态文件放在任务临时目录，不写入或暂存到业务仓库。

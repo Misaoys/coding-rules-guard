@@ -111,13 +111,33 @@ class GuardCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
 
+    def create_repo(self, root, rel="src/a.py"):
+        repo = root / "repo"
+        repo.mkdir()
+        self.git(repo, "init", "-b", "main")
+        self.git(repo, "config", "user.name", "Test User")
+        self.git(repo, "config", "user.email", "test@example.invalid")
+        target = repo / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("value = 1\n", encoding="utf-8")
+        self.git(repo, "add", "--", rel)
+        self.git(repo, "commit", "-m", "initial")
+        return repo, target
+
     def test_cli_happy_path_without_delivery(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            state = Path(temp_dir) / "state.json"
+            root = Path(temp_dir)
+            repo, target = self.create_repo(root)
+            state = root / "state.json"
+            result = self.run_guard(
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FAST",
+                "--goal", "bounded", "--write", "src/a.py", "--impact", "no_known_impact"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            target.write_text("value = 2\n", encoding="utf-8")
             commands = [
-                ("init", "--state", str(state), "--mode", "FAST", "--goal", "bounded", "--write", "src/a.py", "--impact", "no_known_impact"),
                 ("transition", "--state", str(state), "--to", "implement"),
-                ("set-changes", "--state", str(state), "--file", "src/a.py"),
+                ("set-changes", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "verify"),
                 ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "unit", "--command", "test", "--observed", "passed", "--level", "test", "--result", "pass"),
                 ("record-evidence", "--state", str(state), "--kind", "boundary", "--entry", "edge", "--command", "test edge", "--observed", "passed", "--level", "test", "--result", "pass"),
@@ -132,9 +152,11 @@ class GuardCliTests(unittest.TestCase):
 
     def test_cli_returns_machine_readable_failure(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            state = Path(temp_dir) / "state.json"
+            root = Path(temp_dir)
+            repo, _ = self.create_repo(root)
+            state = root / "state.json"
             result = self.run_guard(
-                "init", "--state", str(state), "--mode", "FAST", "--goal", "bounded",
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FAST", "--goal", "bounded",
                 "--write", "src/a.py", "--impact", "unverified"
             )
             self.assertEqual(result.returncode, 0)
@@ -145,11 +167,18 @@ class GuardCliTests(unittest.TestCase):
 
     def test_rework_returns_failed_verify_to_implement_and_resets_stale_state(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            state = Path(temp_dir) / "state.json"
+            root = Path(temp_dir)
+            repo, target = self.create_repo(root)
+            state = root / "state.json"
+            result = self.run_guard(
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FAST",
+                "--goal", "repair", "--write", "src/a.py", "--impact", "no_known_impact"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            target.write_text("value = 2\n", encoding="utf-8")
             commands = [
-                ("init", "--state", str(state), "--mode", "FAST", "--goal", "repair", "--write", "src/a.py", "--impact", "no_known_impact"),
                 ("transition", "--state", str(state), "--to", "implement"),
-                ("set-changes", "--state", str(state), "--file", "src/a.py"),
+                ("set-changes", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "verify"),
                 ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "runtime", "--command", "run", "--observed", "bug reproduced", "--level", "test", "--result", "fail"),
                 ("set-result", "--state", str(state), "--result", "fail", "--gap", "stale gap"),
@@ -160,6 +189,12 @@ class GuardCliTests(unittest.TestCase):
 
             stale = json.loads(state.read_text(encoding="utf-8"))
             stale["gaps_authorized"] = True
+            stale["gap_authorization"] = {
+                "authorization_id": "stale-authorization",
+                "authorized_by": "user:test",
+                "authorized_at": "2026-08-28T00:00:00+00:00",
+                "reason": "stale authorization must be cleared",
+            }
             stale["delivery_audit"] = {"passed": True, "repo": "stale", "checked_files": ["src/a.py"]}
             state.write_text(json.dumps(stale), encoding="utf-8")
             result = self.run_guard(
@@ -173,22 +208,30 @@ class GuardCliTests(unittest.TestCase):
             self.assertEqual(payload["evidence"], [])
             self.assertEqual(payload["gaps"], [])
             self.assertFalse(payload["gaps_authorized"])
+            self.assertIsNone(payload["gap_authorization"])
             self.assertIsNone(payload["delivery_audit"])
             self.assertEqual(payload["rework_count"], 1)
             self.assertEqual(payload["last_rework_reason"], "implementation defect confirmed")
 
-            result = self.run_guard("set-changes", "--state", str(state), "--file", "src/a.py")
+            result = self.run_guard("set-changes", "--state", str(state))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             result = self.run_guard("transition", "--state", str(state), "--to", "verify")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_rework_requires_failed_evidence_and_direct_back_transition_stays_blocked(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            state = Path(temp_dir) / "state.json"
+            root = Path(temp_dir)
+            repo, target = self.create_repo(root)
+            state = root / "state.json"
+            result = self.run_guard(
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FAST",
+                "--goal", "repair", "--write", "src/a.py", "--impact", "no_known_impact"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            target.write_text("value = 2\n", encoding="utf-8")
             commands = [
-                ("init", "--state", str(state), "--mode", "FAST", "--goal", "repair", "--write", "src/a.py", "--impact", "no_known_impact"),
                 ("transition", "--state", str(state), "--to", "implement"),
-                ("set-changes", "--state", str(state), "--file", "src/a.py"),
+                ("set-changes", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "verify"),
             ]
             for command in commands:
@@ -205,19 +248,22 @@ class GuardCliTests(unittest.TestCase):
 
     def test_rework_streak_warns_then_requires_revised_plan(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            state = Path(temp_dir) / "state.json"
+            root = Path(temp_dir)
+            repo, target = self.create_repo(root)
+            state = root / "state.json"
             result = self.run_guard(
-                "init", "--state", str(state), "--mode", "FAST", "--goal", "first hypothesis",
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FAST", "--goal", "first hypothesis",
                 "--write", "src/a.py", "--impact", "no_known_impact"
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            target.write_text("value = 2\n", encoding="utf-8")
             result = self.run_guard("transition", "--state", str(state), "--to", "implement")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
             rework_outputs = []
             for attempt in range(1, 4):
                 commands = [
-                    ("set-changes", "--state", str(state), "--file", "src/a.py"),
+                    ("set-changes", "--state", str(state)),
                     ("transition", "--state", str(state), "--to", "verify"),
                     ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "runtime", "--command", "run", "--observed", f"attempt {attempt} failed", "--level", "test", "--result", "fail"),
                     ("set-result", "--state", str(state), "--result", "fail"),
@@ -267,16 +313,23 @@ class GuardCliTests(unittest.TestCase):
 
     def test_successful_verification_resets_only_the_rework_streak(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            state = Path(temp_dir) / "state.json"
+            root = Path(temp_dir)
+            repo, target = self.create_repo(root)
+            state = root / "state.json"
+            result = self.run_guard(
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FAST",
+                "--goal", "repair", "--write", "src/a.py", "--impact", "no_known_impact"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            target.write_text("value = 2\n", encoding="utf-8")
             commands = [
-                ("init", "--state", str(state), "--mode", "FAST", "--goal", "repair", "--write", "src/a.py", "--impact", "no_known_impact"),
                 ("transition", "--state", str(state), "--to", "implement"),
-                ("set-changes", "--state", str(state), "--file", "src/a.py"),
+                ("set-changes", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "verify"),
                 ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "runtime", "--command", "run", "--observed", "failed", "--level", "test", "--result", "fail"),
                 ("set-result", "--state", str(state), "--result", "fail"),
                 ("rework", "--state", str(state), "--reason", "implementation defect"),
-                ("set-changes", "--state", str(state), "--file", "src/a.py"),
+                ("set-changes", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "verify"),
                 ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "runtime", "--command", "run", "--observed", "passed", "--level", "test", "--result", "pass"),
                 ("record-evidence", "--state", str(state), "--kind", "boundary", "--entry", "edge", "--command", "run edge", "--observed", "passed", "--level", "test", "--result", "pass"),
@@ -294,23 +347,19 @@ class GuardCliTests(unittest.TestCase):
     def test_delivery_audit_checks_real_git_scope(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            repo = root / "repo"
-            repo.mkdir()
-            self.git(repo, "init", "-b", "main")
-            self.git(repo, "config", "user.name", "Test User")
-            self.git(repo, "config", "user.email", "test@example.invalid")
-            allowed = repo / "src" / "allowed.py"
-            allowed.parent.mkdir()
-            allowed.write_text("before = True\n", encoding="utf-8")
-            self.git(repo, "add", "--", "src/allowed.py")
-            self.git(repo, "commit", "-m", "initial")
+            repo, allowed = self.create_repo(root, "src/allowed.py")
+            state = root / "state.json"
+            result = self.run_guard(
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FULL",
+                "--goal", "deliver", "--write", "src/allowed.py", "--impact", "no_known_impact",
+                "--delivery-required"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             allowed.write_text("after = True\n", encoding="utf-8")
 
-            state = root / "state.json"
             commands = [
-                ("init", "--state", str(state), "--mode", "FULL", "--goal", "deliver", "--write", "src/allowed.py", "--impact", "no_known_impact", "--delivery-required"),
                 ("transition", "--state", str(state), "--to", "implement"),
-                ("set-changes", "--state", str(state), "--file", "src/allowed.py"),
+                ("set-changes", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "verify"),
                 ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "unit", "--command", "test", "--observed", "passed", "--level", "test", "--result", "pass"),
                 ("record-evidence", "--state", str(state), "--kind", "boundary", "--entry", "edge", "--command", "test edge", "--observed", "passed", "--level", "test", "--result", "pass"),
@@ -324,6 +373,135 @@ class GuardCliTests(unittest.TestCase):
             payload = json.loads(state.read_text(encoding="utf-8"))
             self.assertTrue(payload["delivery_audit"]["passed"])
             self.assertEqual(payload["delivery_audit"]["checked_files"], ["src/allowed.py"])
+
+    def test_git_baseline_excludes_untouched_dirty_files_and_forbids_declared_changes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = root / "repo"
+            repo.mkdir()
+            self.git(repo, "init", "-b", "main")
+            self.git(repo, "config", "user.name", "Test User")
+            self.git(repo, "config", "user.email", "test@example.invalid")
+            allowed = repo / "src" / "allowed.py"
+            preexisting = repo / "src" / "preexisting.py"
+            allowed.parent.mkdir()
+            allowed.write_text("value = 1\n", encoding="utf-8")
+            preexisting.write_text("value = 1\n", encoding="utf-8")
+            self.git(repo, "add", "--", "src/allowed.py", "src/preexisting.py")
+            self.git(repo, "commit", "-m", "initial")
+            preexisting.write_text("user_change = True\n", encoding="utf-8")
+
+            state = root / "state.json"
+            result = self.run_guard(
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FAST",
+                "--goal", "machine detected changes", "--write", "src/allowed.py", "--impact", "no_known_impact"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            allowed.write_text("task_change = True\n", encoding="utf-8")
+            result = self.run_guard("transition", "--state", str(state), "--to", "implement")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            result = self.run_guard("set-changes", "--state", str(state))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(payload["changed_files"], ["src/allowed.py"])
+            self.assertEqual(payload["change_detection"], "git_baseline")
+
+            result = self.run_guard("set-changes", "--state", str(state), "--file", "src/allowed.py")
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "DECLARED_CHANGES_FORBIDDEN")
+
+            preexisting.write_text("task_modified_user_change = True\n", encoding="utf-8")
+            result = self.run_guard("set-changes", "--state", str(state))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(payload["changed_files"], ["src/allowed.py", "src/preexisting.py"])
+            result = self.run_guard("transition", "--state", str(state), "--to", "verify")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("out-of-scope changes", " ".join(json.loads(result.stdout)["details"]))
+
+    def test_gap_authorization_is_a_separate_audited_command(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = root / "repo"
+            repo.mkdir()
+            self.git(repo, "init", "-b", "main")
+            self.git(repo, "config", "user.name", "Test User")
+            self.git(repo, "config", "user.email", "test@example.invalid")
+            target = repo / "src" / "a.py"
+            target.parent.mkdir()
+            target.write_text("value = 1\n", encoding="utf-8")
+            self.git(repo, "add", "--", "src/a.py")
+            self.git(repo, "commit", "-m", "initial")
+
+            state = root / "state.json"
+            result = self.run_guard(
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FAST",
+                "--goal", "authorize a real gap", "--write", "src/a.py", "--impact", "no_known_impact"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            target.write_text("value = 2\n", encoding="utf-8")
+            commands = [
+                ("transition", "--state", str(state), "--to", "implement"),
+                ("set-changes", "--state", str(state)),
+                ("transition", "--state", str(state), "--to", "verify"),
+                ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "unit", "--command", "test", "--observed", "passed", "--level", "test", "--result", "pass"),
+                ("record-evidence", "--state", str(state), "--kind", "boundary", "--entry", "host", "--command", "host test", "--observed", "host unavailable", "--level", "host", "--result", "blocked"),
+                ("set-result", "--state", str(state), "--result", "pass_with_gaps", "--gap", "host unavailable"),
+            ]
+            for command in commands:
+                result = self.run_guard(*command)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            result = self.run_guard("transition", "--state", str(state), "--to", "complete")
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "TRANSITION_BLOCKED")
+
+            result = self.run_guard(
+                "authorize-gaps", "--state", str(state), "--authorized-by", "agent:codex", "--reason", "self approval"
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "INVALID_AUTHORIZER")
+
+            result = self.run_guard(
+                "authorize-gaps", "--state", str(state), "--authorized-by", "user:viola", "--reason", "accepted host gap"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(payload["gap_authorization"]["authorized_by"], "user:viola")
+            self.assertEqual(payload["gap_authorization"]["reason"], "accepted host gap")
+            self.assertTrue(payload["gap_authorization"]["authorized_at"].endswith("+00:00"))
+
+            valid_payload = payload
+            tampered = json.loads(json.dumps(payload))
+            tampered["gap_authorization"]["authorized_by"] = "agent:codex"
+            state.write_text(json.dumps(tampered), encoding="utf-8")
+            result = self.run_guard("transition", "--state", str(state), "--to", "complete")
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "STATE_SCHEMA_INVALID")
+            state.write_text(json.dumps(valid_payload), encoding="utf-8")
+
+            result = self.run_guard("transition", "--state", str(state), "--to", "complete")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_git_head_change_invalidates_the_baseline(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo, target = self.create_repo(root)
+            state = root / "state.json"
+            result = self.run_guard(
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FAST",
+                "--goal", "detect moved baseline", "--write", "src/a.py", "--impact", "no_known_impact"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            target.write_text("value = 2\n", encoding="utf-8")
+            self.git(repo, "add", "--", "src/a.py")
+            self.git(repo, "commit", "-m", "move head")
+            result = self.run_guard("transition", "--state", str(state), "--to", "implement")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            result = self.run_guard("set-changes", "--state", str(state))
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "GIT_BASELINE_MOVED")
 
 
 if __name__ == "__main__":

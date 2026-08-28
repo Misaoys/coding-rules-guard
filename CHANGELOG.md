@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0 - 2026-08-28
+
+- Added Git baseline capture at init and automatic task-diff calculation in `set-changes`.
+- Excluded untouched pre-existing dirty files while detecting further task edits to those files.
+- Invalidated run state when Git HEAD moves and rejected Agent-declared files for new v2 states.
+- Split `pass_with_gaps` requests from the independent `authorize-gaps` command.
+- Recorded authorization ID, external actor, machine-generated UTC time, and reason.
+- Kept legacy v1 state loading for in-progress runs while all new states use schema v2.
+
 ## 0.3.0 - 2026-08-28
 
 - Added a consecutive rework streak with a warning on the second attempt.

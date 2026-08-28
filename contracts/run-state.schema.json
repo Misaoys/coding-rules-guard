@@ -15,10 +15,20 @@
     "risk",
     "result",
     "delivery_required",
-    "gaps_authorized"
+    "gaps_authorized",
+    "gap_authorization",
+    "rework_count",
+    "last_rework_reason",
+    "rework_streak",
+    "replan_required",
+    "plan_revision",
+    "repo",
+    "git_baseline",
+    "change_detection",
+    "delivery_audit"
   ],
   "properties": {
-    "schema_version": { "const": 1 },
+    "schema_version": { "const": 2 },
     "run_id": { "type": "string", "minLength": 1 },
     "mode": { "enum": ["FAST", "FULL"] },
     "phase": { "enum": ["plan", "implement", "verify", "deliver", "complete"] },
@@ -54,11 +64,36 @@
     "gaps": { "type": "array", "items": { "type": "string", "minLength": 1 } },
     "delivery_required": { "type": "boolean" },
     "gaps_authorized": { "type": "boolean" },
+    "gap_authorization": {
+      "type": ["object", "null"],
+      "properties": {
+        "authorization_id": { "type": "string", "minLength": 1 },
+        "authorized_by": { "type": "string", "pattern": "^(user|host):" },
+        "authorized_at": { "type": "string", "format": "date-time" },
+        "reason": { "type": "string", "minLength": 1 }
+      },
+      "required": ["authorization_id", "authorized_by", "authorized_at", "reason"],
+      "additionalProperties": false
+    },
     "rework_count": { "type": "integer", "minimum": 0 },
     "last_rework_reason": { "type": ["string", "null"] },
     "rework_streak": { "type": "integer", "minimum": 0 },
     "replan_required": { "type": "boolean" },
     "plan_revision": { "type": "integer", "minimum": 1 },
+    "repo": { "type": "string", "minLength": 1 },
+    "git_baseline": {
+      "type": "object",
+      "properties": {
+        "head": { "type": "string", "minLength": 1 },
+        "files": {
+          "type": "object",
+          "additionalProperties": { "type": "string", "minLength": 1 }
+        }
+      },
+      "required": ["head", "files"],
+      "additionalProperties": false
+    },
+    "change_detection": { "const": "git_baseline" },
     "delivery_audit": {
       "type": ["object", "null"],
       "properties": {

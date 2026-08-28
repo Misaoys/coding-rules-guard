@@ -19,7 +19,7 @@ description: 阶段 3：执行不可绕过的真实验证，输出短证据卡�
 - CEP/AE/原生：到达真实宿主、原生窗口或目标运行时。
 - 安装/发布：加载、安装、启动/重启或产物检查，并核对当前版本。
 
-至少记录成功路径和一个关键失败/边界路径。用 `guard.py record-evidence` 分别记录，随后用 `guard.py set-result` 写入 `pass / pass_with_gaps / blocked / fail`。缺少目标层证据时必须写明 GAP；只有用户明确接受缺口后才能对 `pass_with_gaps` 使用 `--authorize-gaps`。
+至少记录成功路径和一个关键失败/边界路径。用 `guard.py record-evidence` 分别记录，随后用 `guard.py set-result` 写入 `pass / pass_with_gaps / blocked / fail`。缺少目标层证据时必须写明 GAP。`set-result` 只能申请 `pass_with_gaps`，不能同时批准；Agent 必须停下等待用户或宿主明确接受，再由独立的 `guard.py authorize-gaps --authorized-by user:<身份> --reason <原因>` 记录机器时间与授权。没有独立授权记录不得 Complete 或 Deliver。
 
 若影响评估指出调用方、相邻功能或公共契约可能受影响，覆盖风险最高的未受影响路径；无法覆盖时如实记录 GAP。确认实现缺陷时先记录失败证据并设置 `fail`，再执行 `guard.py rework --reason <原因>`。收到 `REPLAN_RECOMMENDED` 时重新检查假设；收到 `REPLAN_REQUIRED` 时停止返工并回到 Plan。命令会清除失效结果、证据和授权，修改后必须重新进入 Verify，不以先前通过代替复检。
 

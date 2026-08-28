@@ -1,0 +1,4 @@
+interface:
+  display_name: "编码规则：执行"
+  short_description: "按 Plan 卡片执行并遵守返工门禁"
+  default_prompt: "只执行 coding-rules-implement；仅接收完成的 Plan 卡片，计划后默认使用 LUNA max，主聊天 SOL xhigh 终审，返工后复检。"

@@ -1,0 +1,33 @@
+{
+  "name": "coding-rules-guard",
+  "version": "0.1.0+codex.20260824153158",
+  "description": "FAST/FULL coding workflow with evidence-first validation and explicit cross-feature impact gates.",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "keywords": [
+    "coding-rules",
+    "verification",
+    "codex",
+    "collaboration",
+    "git",
+    "phased-workflow"
+  ],
+  "interface": {
+    "displayName": "Coding Rules Guard",
+    "shortDescription": "FAST/FULL \u5206\u6d41\uff0c\u53ea\u52a0\u8f7d\u5f53\u524d\u9636\u6bb5\u3002",
+    "longDescription": "Coding Rules Guard uses a short FAST path for low-risk work, escalates to FULL for cross-layer or high-risk work, requires one smallest discriminating real check before a repair decision, and makes cross-feature impact assessment and honest disclosure mandatory. It prohibits deliberately wrong tests and redundant verification work, while keeping regression coverage for confirmed behavior.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "composerIcon": "./assets/coding-icon-light.svg",
+    "logo": "./assets/coding-icon-light.svg",
+    "logoDark": "./assets/coding-icon-dark.svg",
+    "capabilities": [
+      "Plan",
+      "Write",
+      "Verify"
+    ],
+    "defaultPrompt": "Choose FAST or FULL and load only the current coding-rules phase. For each hypothesis, run one smallest discriminating real check first, then repair based on that result; assess callers, adjacent functions and public contracts before every write, and disclose known or unverified impacts honestly."
+  }
+}

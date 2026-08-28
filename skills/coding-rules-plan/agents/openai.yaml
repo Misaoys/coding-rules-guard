@@ -1,0 +1,4 @@
+interface:
+  display_name: "编码规则：规划"
+  short_description: "选择 FAST/FULL、子代理模型和审核门"
+  default_prompt: "只执行 coding-rules-plan；只产出 7 项卡片，不创建或调用子代理，计划完成后由后续阶段默认使用 LUNA max，SOL xhigh 做最终审核和复工检验。"

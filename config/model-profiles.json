@@ -1,18 +1,25 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "delegation": {
-    "policy": "risk_triggered",
-    "default_profile": "subagent_default"
+    "policy": "all_write_tasks",
+    "executor_profile": "executor_default",
+    "reviewer_profile": "reviewer_default",
+    "review_required_for": "all_write_tasks",
+    "read_only_policy": "no_delegation"
   },
   "profiles": {
-    "subagent_default": {
+    "executor_default": {
       "model": "gpt-5.6-luna",
       "reasoning_effort": "max"
+    },
+    "reviewer_default": {
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "xhigh"
     }
   },
   "fallback": {
     "when": "configured profile is unavailable or unsupported",
-    "strategy": "use the best available cost-efficient coding model at its highest supported reasoning effort",
+    "strategy": "use the best available configured fallback for the requested role and report the substitution",
     "must_report": true
   }
 }

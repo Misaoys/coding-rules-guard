@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0 - 2026-08-29
+
+- Made `gpt-5.6-luna` with `max` reasoning the default executor for every WRITE task, including FAST and small changes; read-only tasks do not delegate.
+- Added a centralized `gpt-5.6-sol` with `xhigh` reasoning reviewer profile and an independent review gate for every WRITE task.
+- Added schema v3 review state and `record-review`; missing, failed, stale, or configuration-mismatched reviews block Complete and Deliver.
+- Bound review and audit to the complete baseline-to-final Git delta so post-audit extra commits invalidate review while a legal reviewed commit can complete.
+- Required formal delivery reviews to bind the staged index mode/blob identities, rejecting index/worktree splits and comparing the final HEAD tree to the reviewed delta.
+- Used baseline tree identities for staged paths, including tracked deletions, and rejected non-delivery reviews with task-only staged content.
+- Kept legacy state loading, but fail closed for v1 write review and require v3 rebuild when v2 cannot bind a changed HEAD.
+- Documented that the local CLI records auditable claims but cannot cryptographically prove the actual reviewer identity.
+
 ## 0.4.1 - 2026-08-29
 
 - Added a centralized, risk-triggered subagent model profile.

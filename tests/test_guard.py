@@ -83,7 +83,32 @@ class GuardUnitTests(unittest.TestCase):
         with self.assertRaises(guard.GateError):
             guard.check_transition(state, "complete")
         state["gaps_authorized"] = True
-        guard.check_transition(state, "complete")
+        state["review_required"] = True
+        state["reviewer_profile"] = "reviewer_default"
+        state["review"] = {
+            "profile": "reviewer_default",
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "xhigh",
+            "result": "pass",
+            "observed": "legacy state independently reviewed",
+            "reviewed_at": "2026-08-29T00:00:00+00:00",
+            "task_fingerprint": "legacy-state",
+        }
+        with self.assertRaises(guard.GateError) as raised:
+            guard.check_transition(state, "complete")
+        self.assertIn("REVIEW_STATE_UPGRADE_REQUIRED", " ".join(raised.exception.details))
+
+    def test_legacy_write_state_cannot_complete_without_review(self):
+        state = self.base_state()
+        state["phase"] = "verify"
+        state["result"] = "pass"
+        state["evidence"] = [
+            {"kind": "success", "entry": "run", "command": "test", "observed": "ok", "level": "test", "result": "pass"},
+            {"kind": "boundary", "entry": "edge", "command": "test edge", "observed": "ok", "level": "test", "result": "pass"},
+        ]
+        with self.assertRaises(guard.GateError) as raised:
+            guard.check_transition(state, "complete")
+        self.assertIn("reviewer record is required", " ".join(raised.exception.details))
 
     def test_failed_evidence_cannot_be_reported_as_pass(self):
         state = self.base_state()
@@ -124,6 +149,143 @@ class GuardCliTests(unittest.TestCase):
         self.git(repo, "commit", "-m", "initial")
         return repo, target
 
+    def create_verified_run(self, root):
+        repo, target = self.create_repo(root)
+        state = root / "state.json"
+        result = self.run_guard(
+            "init", "--state", str(state), "--repo", str(repo), "--mode", "FAST",
+            "--goal", "review gate", "--write", "src/a.py", "--impact", "no_known_impact"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        initialized = json.loads(state.read_text(encoding="utf-8"))
+        self.assertEqual(initialized["schema_version"], 3)
+        self.assertTrue(initialized["review_required"])
+        self.assertEqual(initialized["executor_profile"], "executor_default")
+        self.assertEqual(initialized["reviewer_profile"], "reviewer_default")
+        self.assertIsNone(initialized["review"])
+        target.write_text("value = 2\n", encoding="utf-8")
+        commands = [
+            ("transition", "--state", str(state), "--to", "implement"),
+            ("set-changes", "--state", str(state)),
+            ("transition", "--state", str(state), "--to", "verify"),
+            ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "unit", "--command", "test", "--observed", "passed", "--level", "test", "--result", "pass"),
+            ("record-evidence", "--state", str(state), "--kind", "boundary", "--entry", "edge", "--command", "test edge", "--observed", "passed", "--level", "test", "--result", "pass"),
+            ("set-result", "--state", str(state), "--result", "pass"),
+        ]
+        for command in commands:
+            result = self.run_guard(*command)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return repo, state
+
+    def test_new_write_state_requires_an_independent_review(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _, state = self.create_verified_run(root)
+            result = self.run_guard("transition", "--state", str(state), "--to", "complete")
+            self.assertEqual(result.returncode, 2)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["code"], "TRANSITION_BLOCKED")
+            self.assertIn("reviewer record is required", " ".join(payload["details"]))
+
+    def test_executor_profile_mismatch_blocks_implementation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo, _ = self.create_repo(root)
+            state = root / "state.json"
+            result = self.run_guard(
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FAST",
+                "--goal", "executor gate", "--write", "src/a.py", "--impact", "no_known_impact"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(state.read_text(encoding="utf-8"))
+            payload["executor_profile"] = "wrong-executor"
+            state.write_text(json.dumps(payload), encoding="utf-8")
+            result = self.run_guard("transition", "--state", str(state), "--to", "implement")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("executor profile mismatch", " ".join(json.loads(result.stdout)["details"]))
+
+    def test_failed_independent_review_blocks_completion(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _, state = self.create_verified_run(root)
+            result = self.run_guard(
+                "record-review", "--state", str(state), "--result", "fail",
+                "--observed", "Sol xhigh found an implementation issue"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            result = self.run_guard("transition", "--state", str(state), "--to", "complete")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("reviewer result must be pass", " ".join(json.loads(result.stdout)["details"]))
+            result = self.run_guard(
+                "rework", "--state", str(state), "--reason", "Sol review found an implementation defect"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(json.loads(state.read_text(encoding="utf-8"))["phase"], "implement")
+
+    def test_configured_sol_xhigh_review_allows_completion(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _, state = self.create_verified_run(root)
+            result = self.run_guard(
+                "record-review", "--state", str(state), "--result", "pass",
+                "--observed", "Sol xhigh independently checked the passing evidence"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            review = json.loads(state.read_text(encoding="utf-8"))["review"]
+            self.assertEqual(review["profile"], "reviewer_default")
+            self.assertEqual(review["model"], "gpt-5.6-sol")
+            self.assertEqual(review["reasoning_effort"], "xhigh")
+            self.assertTrue(review["observed"])
+            self.assertTrue(review["reviewed_at"].endswith("+00:00"))
+            self.assertTrue(review["task_fingerprint"])
+            result = self.run_guard("transition", "--state", str(state), "--to", "complete")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_review_becomes_stale_after_same_file_changes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo, state = self.create_verified_run(root)
+            result = self.run_guard(
+                "record-review", "--state", str(state), "--result", "pass", "--observed", "independent pass"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            (repo / "src" / "a.py").write_text("value = 3\n", encoding="utf-8")
+            result = self.run_guard("transition", "--state", str(state), "--to", "complete")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("REVIEW_STALE", " ".join(json.loads(result.stdout)["details"]))
+
+    def test_v2_review_uses_real_fingerprint_and_becomes_stale(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo, state = self.create_verified_run(root)
+            payload = json.loads(state.read_text(encoding="utf-8"))
+            payload["schema_version"] = 2
+            state.write_text(json.dumps(payload), encoding="utf-8")
+            result = self.run_guard(
+                "record-review", "--state", str(state), "--result", "pass", "--observed", "legacy v2 reviewed"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            (repo / "src" / "a.py").write_text("value = 4\n", encoding="utf-8")
+            result = self.run_guard("transition", "--state", str(state), "--to", "complete")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("REVIEW_STALE", " ".join(json.loads(result.stdout)["details"]))
+
+    def test_set_result_invalidates_an_existing_review(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _, state = self.create_verified_run(root)
+            commands = [
+                ("record-review", "--state", str(state), "--result", "pass", "--observed", "independent pass"),
+                ("set-result", "--state", str(state), "--result", "pass"),
+            ]
+            for command in commands:
+                result = self.run_guard(*command)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIsNone(json.loads(state.read_text(encoding="utf-8"))["review"])
+            result = self.run_guard("transition", "--state", str(state), "--to", "complete")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("reviewer record is required", " ".join(json.loads(result.stdout)["details"]))
+
     def test_cli_happy_path_without_delivery(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -142,6 +304,7 @@ class GuardCliTests(unittest.TestCase):
                 ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "unit", "--command", "test", "--observed", "passed", "--level", "test", "--result", "pass"),
                 ("record-evidence", "--state", str(state), "--kind", "boundary", "--entry", "edge", "--command", "test edge", "--observed", "passed", "--level", "test", "--result", "pass"),
                 ("set-result", "--state", str(state), "--result", "pass"),
+                ("record-review", "--state", str(state), "--result", "pass", "--observed", "Sol xhigh independent review passed"),
                 ("transition", "--state", str(state), "--to", "complete"),
             ]
             for command in commands:
@@ -334,6 +497,7 @@ class GuardCliTests(unittest.TestCase):
                 ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "runtime", "--command", "run", "--observed", "passed", "--level", "test", "--result", "pass"),
                 ("record-evidence", "--state", str(state), "--kind", "boundary", "--entry", "edge", "--command", "run edge", "--observed", "passed", "--level", "test", "--result", "pass"),
                 ("set-result", "--state", str(state), "--result", "pass"),
+                ("record-review", "--state", str(state), "--result", "pass", "--observed", "Sol xhigh independent review passed"),
                 ("transition", "--state", str(state), "--to", "complete"),
             ]
             for command in commands:
@@ -356,6 +520,7 @@ class GuardCliTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             allowed.write_text("after = True\n", encoding="utf-8")
+            self.git(repo, "add", "--", "src/allowed.py")
 
             commands = [
                 ("transition", "--state", str(state), "--to", "implement"),
@@ -364,6 +529,7 @@ class GuardCliTests(unittest.TestCase):
                 ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "unit", "--command", "test", "--observed", "passed", "--level", "test", "--result", "pass"),
                 ("record-evidence", "--state", str(state), "--kind", "boundary", "--entry", "edge", "--command", "test edge", "--observed", "passed", "--level", "test", "--result", "pass"),
                 ("set-result", "--state", str(state), "--result", "pass"),
+                ("record-review", "--state", str(state), "--result", "pass", "--observed", "Sol xhigh independent review passed"),
                 ("transition", "--state", str(state), "--to", "deliver"),
                 ("audit", "--state", str(state), "--repo", str(repo)),
             ]
@@ -373,6 +539,163 @@ class GuardCliTests(unittest.TestCase):
             payload = json.loads(state.read_text(encoding="utf-8"))
             self.assertTrue(payload["delivery_audit"]["passed"])
             self.assertEqual(payload["delivery_audit"]["checked_files"], ["src/allowed.py"])
+            self.assertEqual(
+                payload["delivery_audit"]["task_fingerprint"], payload["review"]["task_fingerprint"]
+            )
+            self.git(repo, "add", "--", "src/allowed.py")
+            self.git(repo, "commit", "-m", "deliver reviewed change")
+            result = self.run_guard("transition", "--state", str(state), "--to", "complete")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_post_audit_extra_committed_file_blocks_completion(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo, allowed = self.create_repo(root, "src/allowed.py")
+            state = root / "state.json"
+            result = self.run_guard(
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FULL",
+                "--goal", "reject extra commit", "--write", "src/allowed.py", "--impact", "no_known_impact",
+                "--delivery-required"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            allowed.write_text("after = True\n", encoding="utf-8")
+            self.git(repo, "add", "--", "src/allowed.py")
+            commands = [
+                ("transition", "--state", str(state), "--to", "implement"),
+                ("set-changes", "--state", str(state)),
+                ("transition", "--state", str(state), "--to", "verify"),
+                ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "unit", "--command", "test", "--observed", "passed", "--level", "test", "--result", "pass"),
+                ("record-evidence", "--state", str(state), "--kind", "boundary", "--entry", "edge", "--command", "edge", "--observed", "passed", "--level", "test", "--result", "pass"),
+                ("set-result", "--state", str(state), "--result", "pass"),
+                ("record-review", "--state", str(state), "--result", "pass", "--observed", "reviewed allowed file"),
+                ("transition", "--state", str(state), "--to", "deliver"),
+                ("audit", "--state", str(state), "--repo", str(repo)),
+            ]
+            for command in commands:
+                result = self.run_guard(*command)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            extra = repo / "src" / "extra.py"
+            extra.write_text("unreviewed = True\n", encoding="utf-8")
+            self.git(repo, "add", "--", "src/allowed.py", "src/extra.py")
+            self.git(repo, "commit", "-m", "commit reviewed and unreviewed files")
+            result = self.run_guard("transition", "--state", str(state), "--to", "complete")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("REVIEW_STALE", " ".join(json.loads(result.stdout)["details"]))
+
+    def test_v2_delivery_audit_uses_the_real_review_fingerprint(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo, target = self.create_repo(root)
+            state = root / "state.json"
+            result = self.run_guard(
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FULL",
+                "--goal", "v2 audit", "--write", "src/a.py", "--impact", "no_known_impact",
+                "--delivery-required"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(state.read_text(encoding="utf-8"))
+            payload["schema_version"] = 2
+            state.write_text(json.dumps(payload), encoding="utf-8")
+            target.write_text("value = 2\n", encoding="utf-8")
+            self.git(repo, "add", "--", "src/a.py")
+            commands = [
+                ("transition", "--state", str(state), "--to", "implement"),
+                ("set-changes", "--state", str(state)),
+                ("transition", "--state", str(state), "--to", "verify"),
+                ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "unit", "--command", "test", "--observed", "passed", "--level", "test", "--result", "pass"),
+                ("record-evidence", "--state", str(state), "--kind", "boundary", "--entry", "edge", "--command", "edge", "--observed", "passed", "--level", "test", "--result", "pass"),
+                ("set-result", "--state", str(state), "--result", "pass"),
+                ("record-review", "--state", str(state), "--result", "pass", "--observed", "v2 reviewed"),
+                ("transition", "--state", str(state), "--to", "deliver"),
+                ("audit", "--state", str(state), "--repo", str(repo)),
+            ]
+            for command in commands:
+                result = self.run_guard(*command)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(payload["delivery_audit"]["task_fingerprint"], payload["review"]["task_fingerprint"])
+
+    def test_delivery_review_rejects_index_worktree_split(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo, target = self.create_repo(root)
+            state = root / "state.json"
+            result = self.run_guard(
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FULL",
+                "--goal", "reject hidden index content", "--write", "src/a.py", "--impact", "no_known_impact",
+                "--delivery-required"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            target.write_text("value = 999\n", encoding="utf-8")
+            self.git(repo, "add", "--", "src/a.py")
+            target.write_text("value = 2\n", encoding="utf-8")
+            commands = [
+                ("transition", "--state", str(state), "--to", "implement"),
+                ("set-changes", "--state", str(state)),
+                ("transition", "--state", str(state), "--to", "verify"),
+                ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "unit", "--command", "test", "--observed", "passed", "--level", "test", "--result", "pass"),
+                ("record-evidence", "--state", str(state), "--kind", "boundary", "--entry", "edge", "--command", "edge", "--observed", "passed", "--level", "test", "--result", "pass"),
+                ("set-result", "--state", str(state), "--result", "pass"),
+            ]
+            for command in commands:
+                result = self.run_guard(*command)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            result = self.run_guard(
+                "record-review", "--state", str(state), "--result", "pass", "--observed", "must not pass"
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "REVIEW_STAGE_MISMATCH")
+
+    def test_non_delivery_review_rejects_index_worktree_split(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo, state = self.create_verified_run(root)
+            target = repo / "src" / "a.py"
+            target.write_text("value = 999\n", encoding="utf-8")
+            self.git(repo, "add", "--", "src/a.py")
+            target.write_text("value = 2\n", encoding="utf-8")
+
+            result = self.run_guard(
+                "record-review", "--state", str(state), "--result", "pass", "--observed", "must not pass"
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "REVIEW_STAGE_MISMATCH")
+
+    def test_delivery_deleted_file_can_be_reviewed_audited_and_completed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo, target = self.create_repo(root)
+            state = root / "state.json"
+            result = self.run_guard(
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FULL",
+                "--goal", "deliver deleted file", "--write", "src/a.py", "--impact", "no_known_impact",
+                "--delivery-required"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            target.unlink()
+            self.git(repo, "add", "--", "src/a.py")
+
+            commands = [
+                ("transition", "--state", str(state), "--to", "implement"),
+                ("set-changes", "--state", str(state)),
+                ("transition", "--state", str(state), "--to", "verify"),
+                ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "unit", "--command", "test", "--observed", "passed", "--level", "test", "--result", "pass"),
+                ("record-evidence", "--state", str(state), "--kind", "boundary", "--entry", "edge", "--command", "test edge", "--observed", "passed", "--level", "test", "--result", "pass"),
+                ("set-result", "--state", str(state), "--result", "pass"),
+                ("record-review", "--state", str(state), "--result", "pass", "--observed", "Sol xhigh reviewed deletion"),
+                ("transition", "--state", str(state), "--to", "deliver"),
+                ("audit", "--state", str(state), "--repo", str(repo)),
+            ]
+            for command in commands:
+                result = self.run_guard(*command)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            payload = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(payload["changed_files"], ["src/a.py"])
+            self.assertTrue(payload["delivery_audit"]["passed"])
+            self.git(repo, "commit", "-m", "deliver deleted file")
+            result = self.run_guard("transition", "--state", str(state), "--to", "complete")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_git_baseline_excludes_untouched_dirty_files_and_forbids_declared_changes(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -448,6 +771,7 @@ class GuardCliTests(unittest.TestCase):
                 ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "unit", "--command", "test", "--observed", "passed", "--level", "test", "--result", "pass"),
                 ("record-evidence", "--state", str(state), "--kind", "boundary", "--entry", "host", "--command", "host test", "--observed", "host unavailable", "--level", "host", "--result", "blocked"),
                 ("set-result", "--state", str(state), "--result", "pass_with_gaps", "--gap", "host unavailable"),
+                ("record-review", "--state", str(state), "--result", "pass", "--observed", "Sol xhigh independent review passed"),
             ]
             for command in commands:
                 result = self.run_guard(*command)

@@ -7,8 +7,8 @@ Coding Rules Guard is a Codex plugin for risk-routed coding work. It keeps low-r
 - `FAST` and `FULL` routing based on risk rather than file count alone.
 - Four focused phases: Plan, Implement, Verify, and Deliver.
 - A strict seven-section Plan card for readable scope and acceptance criteria.
-- Risk-based delegation instead of mandatory subagents for every write.
-- Risk-triggered subagents default to `gpt-5.6-luna` with `max` reasoning through one centralized profile.
+- Read-only work stays direct; every task with `WRITE`, including FAST and small changes, defaults to `gpt-5.6-luna` with `max` reasoning.
+- Every write task requires an independent `gpt-5.6-sol` with `xhigh` review before Complete or Deliver.
 - Machine-readable run state, write-scope checks, evidence records, and delivery audit.
 - Git-baseline change detection that does not trust Agent-declared file lists.
 - Separate, audited gap authorization with machine-generated time and external actor identity.
@@ -37,16 +37,35 @@ Restart or reload Codex if the current session does not pick up newly installed 
 
 ## Delegation profile
 
-Delegation remains opt-in by task shape: direct execution is still the default for simple or tightly coupled work. When delegation has a clear benefit, the bundled `config/model-profiles.json` selects:
+The bundled `config/model-profiles.json` assigns separate execution and review roles for every write task:
 
 ```json
 {
-  "model": "gpt-5.6-luna",
-  "reasoning_effort": "max"
+  "executor_default": {
+    "model": "gpt-5.6-luna",
+    "reasoning_effort": "max"
+  },
+  "reviewer_default": {
+    "model": "gpt-5.6-sol",
+    "reasoning_effort": "xhigh"
+  }
 }
 ```
 
-An explicit user model choice takes precedence. If Luna or `max` is unavailable, the agent must use the configured cost-efficient fallback and disclose the substitution.
+Read-only tasks do not delegate. An explicit user model choice takes precedence. If a configured role is unavailable, the agent must use the role fallback and disclose the substitution.
+
+After verification, the independent reviewer is recorded with:
+
+```powershell
+git add -- src/target.py tests/test_target.py
+
+python scripts/guard.py record-review `
+  --state .\work\run-state.json `
+  --result pass `
+  --observed "Sol xhigh independently checked the current task diff"
+```
+
+For formal delivery, task files must be explicitly staged before Sol review, with no index/worktree split on task paths. The review binds the exact staged path set and Git mode/blob identities. Audit records the same fingerprint, and Complete recomputes the final baseline-to-HEAD tree delta. A hidden staged version, later edit, extra committed path, mode/blob change, evidence change, result change, rework, or revised Plan makes the review stale and blocks completion. Non-delivery FAST work binds the worktree delta instead and rejects task paths left only in the staged index; staged deletions use their baseline tree identity. The local CLI validates this auditable record but cannot cryptographically prove which model or person actually invoked the command; host-level identity enforcement remains a separate boundary.
 
 ## Executable gates
 
@@ -58,6 +77,8 @@ python -m unittest discover -s tests -v
 ```
 
 Run-state files are task artifacts. Keep them in a temporary or task-work directory and do not stage them in the target repository.
+
+Read-only tasks stop after Plan and do not create a run-state file or subagent. Run-state initialization is for tasks with `WRITE`.
 
 Initialize before modifying the repository, then let Git baseline detection discover task changes:
 
@@ -73,7 +94,9 @@ python scripts/guard.py init `
 python scripts/guard.py set-changes --state .\work\run-state.json
 ```
 
-`set-changes --file ...` is rejected for new v2 states. Pre-existing dirty files are fingerprinted at init: untouched files remain outside the task, while further task edits to them are detected. A changed Git HEAD invalidates the baseline.
+`set-changes --file ...` is rejected for new v3 states. Pre-existing dirty files are fingerprinted at init: untouched files remain outside the task, while further task edits to them are detected. A changed Git HEAD must remain a descendant of the baseline and match the reviewed/audited delta.
+
+Legacy v2 states can record a real review while HEAD remains at their baseline, but must be rebuilt as v3 before a post-commit completion. Legacy v1 write states lack a bindable Git baseline and fail closed with `REVIEW_STATE_UPGRADE_REQUIRED`.
 
 When Verify confirms an implementation defect, record the failed evidence and return through the dedicated rework gate:
 

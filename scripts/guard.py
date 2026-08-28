@@ -20,8 +20,12 @@ PHASES = {"plan", "implement", "verify", "deliver", "complete"}
 IMPACTS = {"no_known_impact", "known_impact", "unverified"}
 RESULTS = {"pending", "pass", "pass_with_gaps", "blocked", "fail"}
 LEVELS = {"source", "test", "browser", "installed", "host", "production"}
+REVIEW_RESULTS = {"pass", "fail", "blocked"}
+CURRENT_SCHEMA_VERSION = 3
+SUPPORTED_SCHEMA_VERSIONS = {1, 2, CURRENT_SCHEMA_VERSION}
 REWORK_WARN_AT = 2
 REWORK_REPLAN_AT = 3
+MODEL_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "model-profiles.json"
 SECRET_NAME_PATTERNS = (".env", "*.pem", "*.p12", "*.pfx", "id_rsa", "id_ed25519")
 SECRET_CONTENT = re.compile(
     r"(?:-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|"
@@ -64,13 +68,143 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def load_model_config() -> dict[str, Any]:
+    """Load the bundled role profiles without claiming that a process used them."""
+    try:
+        config = json.loads(MODEL_CONFIG_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise GateError("MODEL_CONFIG_MISSING", [str(MODEL_CONFIG_PATH)]) from exc
+    except json.JSONDecodeError as exc:
+        raise GateError("MODEL_CONFIG_INVALID", [str(exc)]) from exc
+
+    if not isinstance(config, dict):
+        raise GateError("MODEL_CONFIG_INVALID", ["config must be an object"])
+    delegation = config.get("delegation")
+    profiles = config.get("profiles")
+    if not isinstance(delegation, dict) or not isinstance(profiles, dict):
+        raise GateError("MODEL_CONFIG_INVALID", ["delegation and profiles are required objects"])
+
+    # 0.4.x used default_profile. Accept it for the loader, while new config
+    # explicitly names executor and reviewer roles.
+    executor_name = delegation.get("executor_profile") or delegation.get("default_profile")
+    reviewer_name = delegation.get("reviewer_profile")
+    errors: list[str] = []
+    if not isinstance(executor_name, str) or not executor_name.strip():
+        errors.append("delegation.executor_profile is required")
+    if not isinstance(reviewer_name, str) or not reviewer_name.strip():
+        errors.append("delegation.reviewer_profile is required")
+
+    normalized_profiles: dict[str, dict[str, str]] = {}
+    for role, name in (("executor", executor_name), ("reviewer", reviewer_name)):
+        if not isinstance(name, str) or not name.strip():
+            continue
+        profile = profiles.get(name)
+        if not isinstance(profile, dict):
+            errors.append(f"{role} profile {name!r} is missing")
+            continue
+        model = profile.get("model")
+        effort = profile.get("reasoning_effort")
+        if not isinstance(model, str) or not model.strip():
+            errors.append(f"profile {name!r}.model is required")
+        if not isinstance(effort, str) or not effort.strip():
+            errors.append(f"profile {name!r}.reasoning_effort is required")
+        if isinstance(model, str) and model.strip() and isinstance(effort, str) and effort.strip():
+            normalized_profiles[name] = {"model": model, "reasoning_effort": effort}
+    if errors:
+        raise GateError("MODEL_CONFIG_INVALID", errors)
+    return {
+        "delegation": {
+            "executor_profile": executor_name,
+            "reviewer_profile": reviewer_name,
+        },
+        "profiles": normalized_profiles,
+    }
+
+
+def configured_role(config: dict[str, Any], role: str) -> tuple[str, dict[str, str]]:
+    name = config["delegation"][f"{role}_profile"]
+    return name, config["profiles"][name]
+
+
+def review_is_required(state: dict[str, Any]) -> bool:
+    # Legacy v1/v2 write states remain review-gated even though they predate
+    # the explicit v3 review fields.
+    return bool(state.get("review_required", state.get("write_scope")))
+
+
+def review_timestamp_is_valid(value: Any) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        timestamp = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return False
+    return timestamp.utcoffset() is not None
+
+
+def ensure_review(state: dict[str, Any]) -> list[str]:
+    if not review_is_required(state):
+        return []
+    errors: list[str] = []
+    try:
+        config = load_model_config()
+        reviewer_name, reviewer = configured_role(config, "reviewer")
+    except GateError as exc:
+        return [f"review configuration unavailable: {detail}" for detail in exc.details]
+
+    if state.get("reviewer_profile") != reviewer_name:
+        errors.append(
+            f"reviewer profile mismatch: state={state.get('reviewer_profile')!r}, configured={reviewer_name!r}"
+        )
+    review = state.get("review")
+    if not isinstance(review, dict):
+        return errors + ["an independent reviewer record is required"]
+    if review.get("result") != "pass":
+        errors.append("independent reviewer result must be pass")
+    if review.get("profile") != reviewer_name:
+        errors.append("review record does not use the configured reviewer profile")
+    if review.get("model") != reviewer["model"]:
+        errors.append("review record model does not match the configured reviewer profile")
+    if review.get("reasoning_effort") != reviewer["reasoning_effort"]:
+        errors.append("review record reasoning effort does not match the configured reviewer profile")
+    if not review_timestamp_is_valid(review.get("reviewed_at")):
+        errors.append("review record must contain a timezone-aware reviewed_at timestamp")
+    try:
+        current_task_fingerprint = compute_task_fingerprint(state)
+    except GateError as exc:
+        errors.extend(f"REVIEW_STALE: {exc.code}: {detail}" for detail in exc.details)
+    else:
+        if review.get("task_fingerprint") != current_task_fingerprint:
+            errors.append("REVIEW_STALE: task fingerprint no longer matches the current Git task state")
+    audit = state.get("delivery_audit")
+    if state.get("phase") == "deliver" and isinstance(audit, dict) and audit.get("passed"):
+        if audit.get("task_fingerprint") != review.get("task_fingerprint"):
+            errors.append("REVIEW_STALE: delivery audit fingerprint does not match the reviewer record")
+    return errors
+
+
+def ensure_executor_profile(state: dict[str, Any]) -> list[str]:
+    if state.get("schema_version") != CURRENT_SCHEMA_VERSION or not state.get("write_scope"):
+        return []
+    try:
+        config = load_model_config()
+        executor_name, _ = configured_role(config, "executor")
+    except GateError as exc:
+        return [f"executor configuration unavailable: {detail}" for detail in exc.details]
+    if state.get("executor_profile") != executor_name:
+        return [
+            f"executor profile mismatch: state={state.get('executor_profile')!r}, configured={executor_name!r}"
+        ]
+    return []
+
+
 def validate_shape(state: dict[str, Any]) -> None:
     if not isinstance(state, dict):
         raise GateError("STATE_SCHEMA_INVALID", ["state must be an object"])
     errors: list[str] = []
     schema_version = state.get("schema_version")
-    if schema_version not in {1, 2}:
-        errors.append("schema_version must be 1 or 2")
+    if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+        errors.append("schema_version must be 1, 2, or 3")
     if state.get("mode") not in {"FAST", "FULL"}:
         errors.append("mode must be FAST or FULL")
     if state.get("phase") not in PHASES:
@@ -98,7 +232,7 @@ def validate_shape(state: dict[str, Any]) -> None:
         errors.append("plan_revision must be a positive integer")
     if not isinstance(state.get("replan_required", False), bool):
         errors.append("replan_required must be a boolean")
-    if schema_version == 2:
+    if schema_version in {2, 3}:
         repo = state.get("repo")
         baseline = state.get("git_baseline")
         if not isinstance(repo, str) or not Path(repo).is_absolute():
@@ -107,6 +241,10 @@ def validate_shape(state: dict[str, Any]) -> None:
             errors.append("git_baseline.head is required")
         elif not isinstance(baseline.get("files"), dict):
             errors.append("git_baseline.files must be an object")
+        elif schema_version == 3 and not isinstance(baseline.get("content_files"), dict):
+            errors.append("git_baseline.content_files must be an object")
+        elif schema_version == 3 and not isinstance(baseline.get("index_files"), dict):
+            errors.append("git_baseline.index_files must be an object")
         if state.get("change_detection") != "git_baseline":
             errors.append("change_detection must be git_baseline")
         authorization = state.get("gap_authorization")
@@ -131,6 +269,48 @@ def validate_shape(state: dict[str, Any]) -> None:
                     errors.append("gap_authorization.authorized_at is invalid")
         if bool(state.get("gaps_authorized")) != (authorization is not None):
             errors.append("gaps_authorized must match gap_authorization")
+    if schema_version == 3:
+        required_review_fields = {"review_required", "executor_profile", "reviewer_profile", "review"}
+        missing_review_fields = sorted(required_review_fields - state.keys())
+        if missing_review_fields:
+            errors.append("missing review fields: " + ", ".join(missing_review_fields))
+        review_required = state.get("review_required")
+        if not isinstance(review_required, bool):
+            errors.append("review_required must be a boolean")
+        executor_profile = state.get("executor_profile")
+        if executor_profile is not None and (not isinstance(executor_profile, str) or not executor_profile.strip()):
+            errors.append("executor_profile must be null or a non-empty string")
+        reviewer_profile = state.get("reviewer_profile")
+        if not isinstance(reviewer_profile, str) or not reviewer_profile.strip():
+            errors.append("reviewer_profile must be a non-empty string")
+        if isinstance(review_required, bool) and review_required != bool(state.get("write_scope")):
+            errors.append("review_required must match whether write_scope is non-empty")
+        if review_required and executor_profile is None:
+            errors.append("executor_profile is required for write tasks")
+        review = state.get("review")
+        if review is not None:
+            if not isinstance(review, dict):
+                errors.append("review must be an object or null")
+            else:
+                required_review_record = {
+                    "profile",
+                    "model",
+                    "reasoning_effort",
+                    "result",
+                    "reviewed_at",
+                    "observed",
+                    "task_fingerprint",
+                }
+                missing_record_fields = sorted(required_review_record - review.keys())
+                if missing_record_fields:
+                    errors.append("missing review record fields: " + ", ".join(missing_record_fields))
+                for field in ("profile", "model", "reasoning_effort", "observed", "reviewed_at"):
+                    if field in review and (not isinstance(review[field], str) or not review[field].strip()):
+                        errors.append(f"review.{field} must be a non-empty string")
+                if review.get("result") not in REVIEW_RESULTS:
+                    errors.append("review.result is invalid")
+                if "reviewed_at" in review and not review_timestamp_is_valid(review.get("reviewed_at")):
+                    errors.append("review.reviewed_at must be timezone-aware")
     for key in ("write_scope", "changed_files", "evidence", "gaps"):
         if not isinstance(state.get(key), list):
             errors.append(f"{key} must be an array")
@@ -207,6 +387,7 @@ def check_transition(state: dict[str, Any], target: str) -> None:
             errors.append("risk impact must be assessed before implementation")
         if state.get("replan_required", False):
             errors.append("revise-plan is required before implementation")
+        errors.extend(ensure_executor_profile(state))
     elif target == "verify":
         if not state["changed_files"]:
             errors.append("changed_files is empty")
@@ -215,11 +396,12 @@ def check_transition(state: dict[str, Any], target: str) -> None:
             errors.append("out-of-scope changes: " + ", ".join(outside))
     elif target in {"deliver", "complete"}:
         errors.extend(ensure_evidence(state))
+        errors.extend(ensure_review(state))
         if state["result"] not in {"pass", "pass_with_gaps"}:
             errors.append("verification result must be pass or pass_with_gaps")
         if state["result"] == "pass_with_gaps" and (not state["gaps"] or not state["gaps_authorized"]):
             errors.append("pass_with_gaps requires listed and explicitly authorized gaps")
-        if state.get("schema_version") == 2 and state["result"] == "pass_with_gaps":
+        if state.get("schema_version") in {2, 3} and state["result"] == "pass_with_gaps":
             if not isinstance(state.get("gap_authorization"), dict):
                 errors.append("pass_with_gaps requires a separate gap authorization record")
         if state["risk"]["impact"] == "unverified":
@@ -265,7 +447,7 @@ def git_repo_root(path: Path) -> Path:
     return Path(roots[0]).resolve()
 
 
-def git_path_fingerprint(repo: Path, rel: str) -> str:
+def filesystem_path_fingerprint(repo: Path, rel: str) -> str:
     digest = hashlib.sha256()
     full_path = repo / Path(rel)
     if full_path.is_symlink():
@@ -273,6 +455,7 @@ def git_path_fingerprint(repo: Path, rel: str) -> str:
         digest.update(str(full_path.readlink()).encode("utf-8", errors="surrogatepass"))
     elif full_path.is_file():
         digest.update(b"file\0")
+        digest.update(b"executable\0" + (b"1" if full_path.stat().st_mode & 0o111 else b"0"))
         with full_path.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
@@ -280,6 +463,12 @@ def git_path_fingerprint(repo: Path, rel: str) -> str:
         digest.update(b"directory\0")
     else:
         digest.update(b"missing\0")
+    return digest.hexdigest()
+
+
+def git_path_fingerprint(repo: Path, rel: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(filesystem_path_fingerprint(repo, rel).encode("ascii"))
     digest.update(b"\0combined-diff\0")
     digest.update(git_bytes(repo, "diff", "--binary", "--no-renames", "HEAD", "--", rel))
     digest.update(b"\0index-diff\0")
@@ -292,7 +481,13 @@ def capture_git_baseline(repo: Path) -> dict[str, Any]:
     if not head:
         raise GateError("GIT_HEAD_REQUIRED", [str(repo)])
     dirty = actual_git_files(repo)
-    return {"head": head[0], "files": {path: git_path_fingerprint(repo, path) for path in dirty}}
+    staged = set(git_lines(repo, "diff", "--cached", "--name-only", "--no-renames", "HEAD"))
+    return {
+        "head": head[0],
+        "files": {path: git_path_fingerprint(repo, path) for path in dirty},
+        "content_files": {path: filesystem_path_fingerprint(repo, path) for path in dirty},
+        "index_files": {path: git_index_identity(repo, path) for path in staged},
+    }
 
 
 def task_git_files(state: dict[str, Any]) -> list[str]:
@@ -309,6 +504,149 @@ def task_git_files(state: dict[str, Any]) -> list[str]:
         if git_path_fingerprint(repo, path) != baseline["files"].get(path)
     ]
     return sorted(changed)
+
+
+def git_is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    result = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", ancestor, descendant],
+        capture_output=True,
+    )
+    if result.returncode not in {0, 1}:
+        raise GateError("GIT_COMMAND_FAILED", [result.stderr.decode("utf-8", errors="replace").strip()])
+    return result.returncode == 0
+
+
+def task_delta_files(state: dict[str, Any]) -> list[str]:
+    schema_version = state.get("schema_version")
+    if schema_version == 1:
+        raise GateError("REVIEW_STATE_UPGRADE_REQUIRED", ["v1 state has no Git baseline for review binding"])
+    repo = Path(state["repo"])
+    baseline = state["git_baseline"]
+    current_head_lines = git_lines(repo, "rev-parse", "HEAD")
+    if not current_head_lines:
+        raise GateError("GIT_HEAD_REQUIRED", [str(repo)])
+    current_head = current_head_lines[0]
+    if current_head == baseline["head"]:
+        return task_git_files(state)
+    if schema_version == 2:
+        raise GateError(
+            "REVIEW_STATE_UPGRADE_REQUIRED",
+            ["v2 state cannot bind review across a changed Git HEAD; rebuild the run with schema v3"],
+        )
+    if not git_is_ancestor(repo, baseline["head"], current_head):
+        raise GateError("GIT_BASELINE_MOVED", ["baseline HEAD is not an ancestor of current HEAD"])
+
+    committed = set(git_lines(repo, "diff", "--name-only", "--no-renames", baseline["head"], current_head))
+    baseline_content = baseline.get("content_files")
+    if not isinstance(baseline_content, dict):
+        raise GateError("REVIEW_STATE_UPGRADE_REQUIRED", ["v3 baseline content fingerprints are missing"])
+    residual: set[str] = set()
+    for rel in actual_git_files(repo):
+        if rel in baseline_content and filesystem_path_fingerprint(repo, rel) == baseline_content[rel]:
+            continue
+        residual.add(rel)
+    return sorted(committed | residual)
+
+
+def git_index_identity(repo: Path, rel: str) -> str:
+    lines = git_lines(repo, "ls-files", "-s", "--", rel)
+    if not lines:
+        return "missing"
+    fields = lines[0].split()
+    if len(fields) < 2:
+        raise GateError("GIT_INDEX_INVALID", [rel, lines[0]])
+    return f"{fields[0]}:{fields[1]}"
+
+
+def git_tree_identity(repo: Path, treeish: str, rel: str) -> str:
+    lines = git_lines(repo, "ls-tree", treeish, "--", rel)
+    if not lines:
+        return "missing"
+    fields = lines[0].split()
+    if len(fields) < 3:
+        raise GateError("GIT_TREE_INVALID", [rel, lines[0]])
+    return f"{fields[0]}:{fields[2]}"
+
+
+def task_staged_files(state: dict[str, Any]) -> list[str]:
+    repo = Path(state["repo"])
+    baseline = state["git_baseline"]
+    current_head = git_lines(repo, "rev-parse", "HEAD")
+    if not current_head or current_head[0] != baseline["head"]:
+        raise GateError("GIT_BASELINE_MOVED", ["staged review requires the baseline HEAD"])
+    baseline_index = baseline.get("index_files", {})
+    current_staged = set(git_lines(repo, "diff", "--cached", "--name-only", "--no-renames", "HEAD"))
+    candidates = current_staged | set(baseline_index)
+    changed: list[str] = []
+    for rel in candidates:
+        baseline_identity = (
+            baseline_index[rel]
+            if rel in baseline_index
+            else git_tree_identity(repo, baseline["head"], rel)
+        )
+        if git_index_identity(repo, rel) != baseline_identity:
+            changed.append(rel)
+    return sorted(changed)
+
+
+def fingerprint_identities(baseline_head: str, identities: list[tuple[str, str]]) -> str:
+    digest = hashlib.sha256()
+    digest.update(baseline_head.encode("utf-8"))
+    for rel, identity in identities:
+        digest.update(b"\0path\0")
+        digest.update(rel.encode("utf-8", errors="surrogatepass"))
+        digest.update(b"\0identity\0")
+        digest.update(identity.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def compute_task_fingerprint(state: dict[str, Any]) -> str:
+    if state.get("schema_version") not in {2, 3}:
+        raise GateError("REVIEW_STATE_UPGRADE_REQUIRED", ["state lacks a reviewable Git baseline"])
+    repo = Path(state["repo"])
+    baseline_head = state["git_baseline"]["head"]
+    current_head_lines = git_lines(repo, "rev-parse", "HEAD")
+    if not current_head_lines:
+        raise GateError("GIT_HEAD_REQUIRED", [str(repo)])
+    current_head = current_head_lines[0]
+
+    if state.get("delivery_required"):
+        if current_head == baseline_head:
+            staged = task_staged_files(state)
+            expected = sorted(state.get("changed_files", []))
+            if staged != expected:
+                raise GateError(
+                    "REVIEW_STAGE_MISMATCH",
+                    [f"staged task paths {staged!r} do not match detected task paths {expected!r}"],
+                )
+            unstaged = set(git_lines(repo, "diff", "--name-only", "--no-renames"))
+            split = sorted(unstaged & set(expected))
+            if split:
+                raise GateError("REVIEW_STAGE_MISMATCH", ["index/worktree split: " + ", ".join(split)])
+            identities = [(rel, git_index_identity(repo, rel)) for rel in staged]
+            return fingerprint_identities(baseline_head, identities)
+
+        if state.get("schema_version") == 2:
+            raise GateError(
+                "REVIEW_STATE_UPGRADE_REQUIRED",
+                ["v2 state cannot bind review to a final commit tree; rebuild with schema v3"],
+            )
+        if not git_is_ancestor(repo, baseline_head, current_head):
+            raise GateError("GIT_BASELINE_MOVED", ["baseline HEAD is not an ancestor of current HEAD"])
+        committed = sorted(
+            set(git_lines(repo, "diff", "--name-only", "--no-renames", baseline_head, current_head))
+        )
+        identities = [(rel, git_tree_identity(repo, current_head, rel)) for rel in committed]
+        return fingerprint_identities(baseline_head, identities)
+
+    staged = task_staged_files(state)
+    if staged:
+        raise GateError(
+            "REVIEW_STAGE_MISMATCH",
+            ["staged task paths are not part of the reviewed worktree: " + ", ".join(staged)],
+        )
+    identities = [(rel, filesystem_path_fingerprint(repo, rel)) for rel in task_delta_files(state)]
+    return fingerprint_identities(baseline_head, identities)
 
 
 def secret_findings(repo: Path, files: Iterable[str]) -> list[str]:
@@ -333,13 +671,18 @@ def secret_findings(repo: Path, files: Iterable[str]) -> list[str]:
 def command_init(args: argparse.Namespace) -> None:
     repo = git_repo_root(args.repo)
     git_baseline = capture_git_baseline(repo)
+    config = load_model_config()
+    executor_name, _ = configured_role(config, "executor")
+    reviewer_name, _ = configured_role(config, "reviewer")
+    write_scope = sorted({normalize_path(item) for item in args.write})
+    review_required = bool(write_scope)
     state = {
-        "schema_version": 2,
+        "schema_version": CURRENT_SCHEMA_VERSION,
         "run_id": args.run_id or str(uuid.uuid4()),
         "mode": args.mode,
         "phase": "plan",
         "goal": args.goal.strip(),
-        "write_scope": sorted({normalize_path(item) for item in args.write}),
+        "write_scope": write_scope,
         "changed_files": [],
         "evidence": [],
         "risk": {"impact": args.impact, "details": args.risk_detail},
@@ -357,6 +700,10 @@ def command_init(args: argparse.Namespace) -> None:
         "repo": str(repo),
         "git_baseline": git_baseline,
         "change_detection": "git_baseline",
+        "review_required": review_required,
+        "executor_profile": executor_name if review_required else None,
+        "reviewer_profile": reviewer_name,
+        "review": None,
     }
     validate_shape(state)
     save_state(args.state, state)
@@ -377,7 +724,12 @@ def command_rework(args: argparse.Namespace) -> None:
     state = load_state(args.state)
     if state["phase"] != "verify":
         raise GateError("WRONG_PHASE", ["rework requires verify phase"])
-    if state["result"] != "fail" and not any(item.get("result") == "fail" for item in state["evidence"]):
+    review_failed = isinstance(state.get("review"), dict) and state["review"].get("result") == "fail"
+    if (
+        state["result"] != "fail"
+        and not any(item.get("result") == "fail" for item in state["evidence"])
+        and not review_failed
+    ):
         raise GateError("REWORK_NOT_JUSTIFIED", ["record failed verification evidence before rework"])
     reason = args.reason.strip()
     if not reason:
@@ -389,6 +741,8 @@ def command_rework(args: argparse.Namespace) -> None:
     state["gaps_authorized"] = False
     state["gap_authorization"] = None
     state["delivery_audit"] = None
+    if "review" in state or state.get("schema_version") == CURRENT_SCHEMA_VERSION:
+        state["review"] = None
     state["rework_count"] = int(state.get("rework_count", 0)) + 1
     state["rework_streak"] = int(state.get("rework_streak", 0)) + 1
     state["last_rework_reason"] = reason
@@ -438,6 +792,14 @@ def command_revise_plan(args: argparse.Namespace) -> None:
     state["gaps_authorized"] = False
     state["gap_authorization"] = None
     state["delivery_audit"] = None
+    if state.get("schema_version") == CURRENT_SCHEMA_VERSION:
+        config = load_model_config()
+        executor_name, _ = configured_role(config, "executor")
+        reviewer_name, _ = configured_role(config, "reviewer")
+        state["review_required"] = bool(revised_scope)
+        state["executor_profile"] = executor_name if revised_scope else None
+        state["reviewer_profile"] = reviewer_name
+        state["review"] = None
     state["rework_streak"] = 0
     state["replan_required"] = False
     state["plan_revision"] = int(state.get("plan_revision", 1)) + 1
@@ -458,7 +820,7 @@ def command_set_changes(args: argparse.Namespace) -> None:
     state = load_state(args.state)
     if state["phase"] != "implement":
         raise GateError("WRONG_PHASE", ["set-changes requires implement phase"])
-    if state["schema_version"] == 2:
+    if state["schema_version"] in {2, 3}:
         if args.file:
             raise GateError("DECLARED_CHANGES_FORBIDDEN", ["v2 states derive changes from the Git baseline"])
         state["changed_files"] = task_git_files(state)
@@ -466,6 +828,8 @@ def command_set_changes(args: argparse.Namespace) -> None:
         if not args.file:
             raise GateError("DECLARED_CHANGES_REQUIRED", ["legacy v1 states require --file"])
         state["changed_files"] = sorted({normalize_path(item) for item in args.file})
+    if "review" in state or state.get("schema_version") == CURRENT_SCHEMA_VERSION:
+        state["review"] = None
     validate_shape(state)
     save_state(args.state, state)
     emit({"ok": True, "changed_files": state["changed_files"]})
@@ -485,6 +849,8 @@ def command_record_evidence(args: argparse.Namespace) -> None:
             "result": args.result,
         }
     )
+    if "review" in state or state.get("schema_version") == CURRENT_SCHEMA_VERSION:
+        state["review"] = None
     validate_shape(state)
     save_state(args.state, state)
     emit({"ok": True, "evidence_count": len(state["evidence"])})
@@ -500,8 +866,58 @@ def command_set_result(args: argparse.Namespace) -> None:
     state["gaps"] = args.gap
     state["gaps_authorized"] = False
     state["gap_authorization"] = None
+    if "review" in state or state.get("schema_version") == CURRENT_SCHEMA_VERSION:
+        state["review"] = None
+    validate_shape(state)
     save_state(args.state, state)
     emit({"ok": True, "result": state["result"], "gaps_authorized": state["gaps_authorized"]})
+
+
+def command_record_review(args: argparse.Namespace) -> None:
+    state = load_state(args.state)
+    if state["phase"] != "verify":
+        raise GateError("WRONG_PHASE", ["record-review requires verify phase"])
+    if not review_is_required(state):
+        raise GateError("REVIEW_NOT_REQUIRED", ["read-only tasks do not require an independent review"])
+    if state["result"] not in {"pass", "pass_with_gaps"}:
+        raise GateError(
+            "REVIEW_NOT_READY",
+            ["set verification result to pass or pass_with_gaps before recording the review"],
+        )
+
+    config = load_model_config()
+    executor_name, _ = configured_role(config, "executor")
+    reviewer_name, reviewer = configured_role(config, "reviewer")
+    if state.get("schema_version") in {1, 2}:
+        state["review_required"] = bool(state.get("write_scope"))
+        state["executor_profile"] = executor_name if state["review_required"] else None
+        state["reviewer_profile"] = reviewer_name
+    supplied_profile = args.profile
+    if supplied_profile and supplied_profile != reviewer_name:
+        raise GateError("REVIEW_PROFILE_MISMATCH", [f"configured reviewer profile is {reviewer_name!r}"])
+    if args.model and args.model != reviewer["model"]:
+        raise GateError("REVIEW_PROFILE_MISMATCH", [f"configured reviewer model is {reviewer['model']!r}"])
+    if args.reasoning_effort and args.reasoning_effort != reviewer["reasoning_effort"]:
+        raise GateError(
+            "REVIEW_PROFILE_MISMATCH",
+            [f"configured reviewer reasoning effort is {reviewer['reasoning_effort']!r}"],
+        )
+    observed = args.observed.strip()
+    if not observed:
+        raise GateError("REVIEW_OBSERVED_REQUIRED", ["--observed must be non-empty"])
+    reviewed_at = datetime.now(timezone.utc).isoformat()
+    state["review"] = {
+        "profile": reviewer_name,
+        "model": reviewer["model"],
+        "reasoning_effort": reviewer["reasoning_effort"],
+        "result": args.result,
+        "observed": observed,
+        "reviewed_at": reviewed_at,
+        "task_fingerprint": compute_task_fingerprint(state),
+    }
+    validate_shape(state)
+    save_state(args.state, state)
+    emit({"ok": True, "review": state["review"], "state": str(args.state)})
 
 
 def command_authorize_gaps(args: argparse.Namespace) -> None:
@@ -534,7 +950,7 @@ def command_audit(args: argparse.Namespace) -> None:
     if state["phase"] != "deliver":
         raise GateError("WRONG_PHASE", ["audit requires deliver phase"])
     repo = args.repo.resolve()
-    if state["schema_version"] == 2:
+    if state["schema_version"] in {2, 3}:
         if repo != Path(state["repo"]).resolve():
             raise GateError("AUDIT_REPO_MISMATCH", [str(repo), state["repo"]])
         actual = task_git_files(state)
@@ -548,11 +964,24 @@ def command_audit(args: argparse.Namespace) -> None:
     if outside:
         errors.append("out-of-scope git changes: " + ", ".join(outside))
     errors.extend(secret_findings(repo, actual))
+    task_fingerprint = (
+        compute_task_fingerprint(state) if state.get("schema_version") in {2, 3} else "legacy-state"
+    )
     if errors:
-        state["delivery_audit"] = {"passed": False, "repo": str(repo), "checked_files": actual}
+        state["delivery_audit"] = {
+            "passed": False,
+            "repo": str(repo),
+            "checked_files": actual,
+            "task_fingerprint": task_fingerprint,
+        }
         save_state(args.state, state)
         raise GateError("DELIVERY_AUDIT_FAILED", errors)
-    state["delivery_audit"] = {"passed": True, "repo": str(repo), "checked_files": actual}
+    state["delivery_audit"] = {
+        "passed": True,
+        "repo": str(repo),
+        "checked_files": actual,
+        "task_fingerprint": task_fingerprint,
+    }
     save_state(args.state, state)
     emit({"ok": True, "checked_files": actual, "state": str(args.state)})
 
@@ -567,7 +996,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--run-id")
     init.add_argument("--mode", choices=("FAST", "FULL"), required=True)
     init.add_argument("--goal", required=True)
-    init.add_argument("--write", action="append", default=[], required=True)
+    init.add_argument("--write", action="append", default=[])
     init.add_argument("--impact", choices=sorted(IMPACTS), required=True)
     init.add_argument("--risk-detail", action="append", default=[])
     init.add_argument("--delivery-required", action="store_true")
@@ -587,7 +1016,7 @@ def build_parser() -> argparse.ArgumentParser:
     revise_plan.add_argument("--state", type=Path, required=True)
     revise_plan.add_argument("--mode", choices=("FAST", "FULL"), required=True)
     revise_plan.add_argument("--goal", required=True)
-    revise_plan.add_argument("--write", action="append", default=[], required=True)
+    revise_plan.add_argument("--write", action="append", default=[])
     revise_plan.add_argument("--impact", choices=sorted(IMPACTS), required=True)
     revise_plan.add_argument("--risk-detail", action="append", default=[])
     revise_plan.add_argument("--delivery-required", action="store_true")
@@ -613,6 +1042,15 @@ def build_parser() -> argparse.ArgumentParser:
     result.add_argument("--result", choices=("pass", "pass_with_gaps", "blocked", "fail"), required=True)
     result.add_argument("--gap", action="append", default=[])
     result.set_defaults(handler=command_set_result)
+
+    review = subparsers.add_parser("record-review", help="record the configured independent reviewer check")
+    review.add_argument("--state", type=Path, required=True)
+    review.add_argument("--result", choices=sorted(REVIEW_RESULTS), required=True)
+    review.add_argument("--observed", required=True)
+    review.add_argument("--profile")
+    review.add_argument("--model")
+    review.add_argument("--reasoning-effort")
+    review.set_defaults(handler=command_record_review)
 
     authorize = subparsers.add_parser("authorize-gaps", help="record external authorization for verification gaps")
     authorize.add_argument("--state", type=Path, required=True)

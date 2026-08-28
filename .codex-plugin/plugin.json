@@ -1,7 +1,7 @@
 {
   "name": "coding-rules-guard",
-  "version": "0.4.1",
-  "description": "Risk-routed coding workflow with evidence-first validation, executable phase gates, and honest impact disclosure.",
+  "version": "0.5.0",
+  "description": "Risk-routed coding workflow with Luna Max execution for write tasks, independent Sol review gates, executable phase validation, and honest impact disclosure.",
   "author": {
     "name": "Misaoys"
   },
@@ -16,8 +16,8 @@
   ],
   "interface": {
     "displayName": "Coding Rules Guard",
-    "shortDescription": "FAST/FULL \u5206\u6d41\uff0c\u53ea\u52a0\u8f7d\u5f53\u524d\u9636\u6bb5\u3002",
-    "longDescription": "Coding Rules Guard routes low-risk work through a short FAST path, escalates cross-layer or high-risk work to FULL, and uses a bundled state validator to enforce write scope, evidence, impact, and delivery gates. Delegation is risk-based rather than mandatory for every write.",
+    "shortDescription": "FAST/FULL routing with Luna Max execution and Sol xhigh review.",
+    "longDescription": "Coding Rules Guard routes low-risk work through a short FAST path, escalates cross-layer or high-risk work to FULL, and uses a bundled state validator to enforce write scope, evidence, impact, independent Sol xhigh review, and delivery gates. Every WRITE task uses the configured Luna Max executor profile by default; read-only tasks do not delegate.",
     "developerName": "Misaoys",
     "category": "Productivity",
     "composerIcon": "./assets/coding-icon-light.svg",
@@ -29,6 +29,6 @@
       "Verify",
       "Deliver"
     ],
-    "defaultPrompt": "Choose FAST or FULL, load only the current coding-rules phase, keep writes inside the declared scope, run the smallest discriminating real check, and disclose known or unverified impacts honestly."
+    "defaultPrompt": "Choose FAST or FULL, load only the current coding-rules phase, use Luna Max for every WRITE task, keep writes inside the declared scope, run the smallest discriminating real check, record an independent configured Sol xhigh review before Complete or Deliver, and disclose known or unverified impacts honestly."
   }
 }

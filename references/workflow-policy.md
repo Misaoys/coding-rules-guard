@@ -10,7 +10,7 @@
 
 ## 委派
 
-默认直接执行。只有工作能拆成互不写同一文件的独立子任务，并行能明显降低时间或提高独立审查质量时才委派。确认委派后读取 [模型配置](../config/model-profiles.json)：默认子代理使用 `subagent_default`，即 `gpt-5.6-luna + max`。用户明确指定的模型优先；配置模型不可用或不支持该强度时，按配置回退并如实报告。此默认值不改变风险触发条件，也不代表所有写入任务自动创建子代理。
+只读任务不创建子代理。有 `WRITE` 的任务（包括 FAST 和小改动）默认读取 [模型配置](../config/model-profiles.json)，由 `executor_default` 即 `gpt-5.6-luna + max` 执行；用户明确指定的模型优先，配置不可用时按角色回退并报告。所有 `WRITE` 在验证结果确定后，必须由 `reviewer_default` 即 `gpt-5.6-sol + xhigh` 独立检查并写入 `record-review`；review 缺失、失败、配置不符或与当前任务 Diff 指纹不一致时不得 Complete 或 Deliver。本地 CLI 只能校验可审计记录，不能密码学证明实际调用者身份。
 
 ## 证据与结果
 

@@ -23,4 +23,6 @@ description: 阶段 3：执行不可绕过的真实验证，输出短证据卡�
 
 若影响评估指出调用方、相邻功能或公共契约可能受影响，覆盖风险最高的未受影响路径；无法覆盖时如实记录 GAP。确认实现缺陷时先记录失败证据并设置 `fail`，再执行 `guard.py rework --reason <原因>`。收到 `REPLAN_RECOMMENDED` 时重新检查假设；收到 `REPLAN_REQUIRED` 时停止返工并回到 Plan。命令会清除失效结果、证据和授权，修改后必须重新进入 Verify，不以先前通过代替复检。
 
-验证通过后：无正式交付需求就 `transition --to complete`；需要 Git、安装、发布或正式交付就 `transition --to deliver`。只输出：`STATE / ENTRY / COMMAND / OBSERVED / EVIDENCE_LEVEL / RESULT / GAP`。
+所有有 WRITE 的任务在 `set-result` 后必须由配置的 `reviewer_default`（`gpt-5.6-sol + xhigh`）独立检查。需要正式交付时，先用显式路径暂存全部任务文件并确保任务路径不存在 index/worktree 分叉，再让 Sol 检查将要提交的 staged delta；无需交付时检查当前 worktree delta。随后执行 `guard.py record-review --result <pass|fail|blocked> --observed <结论>`。任何后续文件、index、证据、结果或返工变化都会使 review 失效；缺失、失败、配置不符或 Git delta 指纹过期的 review 会被机器门禁阻止。CLI 记录不能替代宿主级调用者身份认证。
+
+Sol review 通过并完成 `record-review` 后：无正式交付需求就 `transition --to complete`；需要 Git、安装、发布或正式交付就 `transition --to deliver`。只输出：`STATE / ENTRY / COMMAND / OBSERVED / EVIDENCE_LEVEL / RESULT / GAP / REVIEW`。

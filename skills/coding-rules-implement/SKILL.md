@@ -9,7 +9,7 @@ description: 阶段 2：按已完成的 Plan 和机器可校验的 WRITE 范围�
 
 1. 在任务临时目录创建未跟踪的状态文件；不要把状态文件写入或暂存到业务仓库。新任务用 `guard.py init --repo <目标仓库>` 记录 Git baseline、`MODE / GOAL / WRITE / RISK`。若状态为 `REPLAN_REQUIRED`，先按新的 Plan 卡片执行 `guard.py revise-plan`；再用 `guard.py transition --to implement` 校验入口。
 2. 只写 `WRITE` 范围；保留公共接口、协议和兼容行为。不要顺手重构或引入未计划的依赖、语言、权限或外部动作。
-3. 只有可独立拆分、不会写同一文件且并行收益明确时才委派；简单或强耦合修改保持直接执行。发生委派时读取 `../../config/model-profiles.json`，默认子代理使用 `gpt-5.6-luna + max`；用户指定优先，不可用时按配置回退并报告。委派必须服从相同 WRITE 范围。
+3. 所有有 WRITE 的任务（包括 FAST 和小改动）默认读取 `../../config/model-profiles.json`，由 `executor_default` 即 `gpt-5.6-luna + max` 执行；用户指定优先，不可用时按角色回退并报告。执行子代理必须服从相同 WRITE 范围，不得自行提交或扩范围。
 4. 修复必须对应已观察到的真实结果；不编写故意失败或未经契约确认的测试，不重复制造无新增信息的诊断。
 5. 修改后执行不带 `--file` 的 `guard.py set-changes`，让机器从 Git baseline 自动计算本任务实际文件，再用 `guard.py transition --to verify` 检查越界。前提变化、HEAD 改变或越界时停止并回到 Plan。
 

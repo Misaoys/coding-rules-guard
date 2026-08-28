@@ -1,0 +1,20 @@
+{
+  "name": "coding-rules-guard",
+  "interface": {
+    "displayName": "Coding Rules Guard"
+  },
+  "plugins": [
+    {
+      "name": "coding-rules-guard",
+      "source": {
+        "source": "local",
+        "path": "."
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

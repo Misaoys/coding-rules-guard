@@ -1,18 +1,16 @@
 ---
 name: coding-rules-implement
-description: 阶段 2：只按完成的 Plan 卡片做最小改动，默认使用 LUNA 子代理群，不扩范围。
+description: 阶段 2：按已完成的 Plan 和机器可校验的 WRITE 范围执行最小修改。
 ---
 
 # 阶段 2：Implement
 
-输入只能是 `$coding-rules-plan` 的 7 项卡片；缺卡片或范围不清就停止并回到 Plan。
+输入是 `$coding-rules-plan` 的 7 项卡片。缺卡片或范围不清就回到 Plan。执行前读取 [共享策略](../../references/workflow-policy.md)，从当前 Skill 目录解析 `../../scripts/guard.py`。
 
-- 只写 `WRITE` 范围；保留公共接口、协议、DOM/事件、生命周期和兼容行为。
-- 每次写入前，检查改动的调用方、相邻功能与公共契约。发现行为会改变或影响尚不明确时，先把范围、原因和受影响路径记录到风险说明；不得把可能影响其他功能的改动伪装成局部无影响修改。
-- 不顺手重构；不引入未写入 Plan 的依赖、第二语言、权限绕过、敏感数据或子聊天。
-- 异常、失败回滚、资源释放和状态恢复必须可预测；发现前提变化就暂停。
-- 修复必须对应已观察到的真实结果；不得先编写故意失败或未经契约确认的测试，再围绕该测试改实现。一次最小、可区分的验证已能决定下一步时，不重复造测试、脚本、夹具或改动。
-- FAST 任务完成改动后只交给 verify；不要展开 FULL 规则。
-- Plan 完成后默认使用子代理组，所有子代理统一 `gpt-5.6-luna + max`；主聊天用 `gpt-5.6-sol + xhigh` 做最终审核。返工后必须回到 verify，并等待同一 SOL xhigh 复工检验，不得自行宣布完成。
+1. 在任务临时目录创建未跟踪的状态文件；不要把状态文件写入或暂存到业务仓库。用 `guard.py init` 记录 `MODE / GOAL / WRITE / RISK`，再用 `guard.py transition --to implement` 校验入口。
+2. 只写 `WRITE` 范围；保留公共接口、协议和兼容行为。不要顺手重构或引入未计划的依赖、语言、权限或外部动作。
+3. 只有可独立拆分、不会写同一文件且并行收益明确时才委派；简单或强耦合修改保持直接执行。委派必须服从相同 WRITE 范围。
+4. 修复必须对应已观察到的真实结果；不编写故意失败或未经契约确认的测试，不重复制造无新增信息的诊断。
+5. 修改后用 `guard.py set-changes` 记录实际文件，再用 `guard.py transition --to verify` 检查越界。前提变化或越界时停止并回到 Plan。
 
-只输出：`CHANGED / UNTOUCHED / VERIFY_ENTRY`。不把编译、静态检查或文件存在写成真实功能通过。
+只输出：`STATE / CHANGED / UNTOUCHED / VERIFY_ENTRY`。不把编译、静态检查或文件存在写成真实功能通过。

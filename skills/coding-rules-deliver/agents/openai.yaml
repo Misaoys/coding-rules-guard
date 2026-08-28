@@ -1,4 +1,4 @@
 interface:
   display_name: "编码规则：交付"
-  short_description: "按需执行 SOL 最终审核和正式交付"
-  default_prompt: "只执行 coding-rules-deliver；子代理组必须在 Plan 后工作，并先过 SOL xhigh 最终审核和必要的复工检验。"
+  short_description: "审计 Diff、Git、版本和交付证据"
+  default_prompt: "使用 $coding-rules-deliver 审计范围、证据和 Git 状态，通过机器门禁后再正式交付。"

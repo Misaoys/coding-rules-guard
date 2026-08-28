@@ -1,4 +1,4 @@
 interface:
   display_name: "编码规则路由"
   short_description: "只选择 FAST/FULL 和当前阶段"
-  default_prompt: "只负责选择 FAST/FULL 和一个当前阶段 skill；Plan 阶段不创建或调用子代理，计划完成后按 WRITE 默认进入子代理群。"
+  default_prompt: "使用 $coding-rules 选择 FAST/FULL 和当前阶段；只做路由，按风险决定是否委派。"

@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Misaoys/coding-rules-guard/contracts/run-state.schema.json",
+  "title": "Coding Rules Guard run state",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "mode",
+    "phase",
+    "goal",
+    "write_scope",
+    "changed_files",
+    "evidence",
+    "risk",
+    "result",
+    "delivery_required",
+    "gaps_authorized"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "run_id": { "type": "string", "minLength": 1 },
+    "mode": { "enum": ["FAST", "FULL"] },
+    "phase": { "enum": ["plan", "implement", "verify", "deliver", "complete"] },
+    "goal": { "type": "string", "minLength": 1 },
+    "write_scope": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+    "changed_files": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "entry", "command", "observed", "level", "result"],
+        "properties": {
+          "kind": { "enum": ["success", "boundary"] },
+          "entry": { "type": "string", "minLength": 1 },
+          "command": { "type": "string", "minLength": 1 },
+          "observed": { "type": "string", "minLength": 1 },
+          "level": { "enum": ["source", "test", "browser", "installed", "host", "production"] },
+          "result": { "enum": ["pass", "fail", "blocked"] }
+        },
+        "additionalProperties": false
+      }
+    },
+    "risk": {
+      "type": "object",
+      "required": ["impact", "details"],
+      "properties": {
+        "impact": { "enum": ["no_known_impact", "known_impact", "unverified"] },
+        "details": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "result": { "enum": ["pending", "pass", "pass_with_gaps", "blocked", "fail"] },
+    "gaps": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "delivery_required": { "type": "boolean" },
+    "gaps_authorized": { "type": "boolean" },
+    "delivery_audit": {
+      "type": ["object", "null"],
+      "properties": {
+        "passed": { "type": "boolean" },
+        "repo": { "type": "string" },
+        "checked_files": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["passed", "repo", "checked_files"],
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

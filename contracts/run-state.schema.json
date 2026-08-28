@@ -54,6 +54,8 @@
     "gaps": { "type": "array", "items": { "type": "string", "minLength": 1 } },
     "delivery_required": { "type": "boolean" },
     "gaps_authorized": { "type": "boolean" },
+    "rework_count": { "type": "integer", "minimum": 0 },
+    "last_rework_reason": { "type": ["string", "null"] },
     "delivery_audit": {
       "type": ["object", "null"],
       "properties": {

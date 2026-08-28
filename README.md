@@ -9,6 +9,7 @@ Coding Rules Guard is a Codex plugin for risk-routed coding work. It keeps low-r
 - A strict seven-section Plan card for readable scope and acceptance criteria.
 - Risk-based delegation instead of mandatory subagents for every write.
 - Machine-readable run state, write-scope checks, evidence records, and delivery audit.
+- A guarded `rework` loop that returns failed verification to implementation and invalidates stale evidence.
 - No default or repeated hash checks; hash parity runs once only when artifact identity is an acceptance criterion.
 - Honest impact labels: no known impact, known impact, or unverified impact.
 
@@ -41,6 +42,15 @@ python -m unittest discover -s tests -v
 ```
 
 Run-state files are task artifacts. Keep them in a temporary or task-work directory and do not stage them in the target repository.
+
+When Verify confirms an implementation defect, record the failed evidence and return through the dedicated rework gate:
+
+```powershell
+python scripts/guard.py set-result --state .\work\run-state.json --result fail
+python scripts/guard.py rework --state .\work\run-state.json --reason "implementation defect confirmed"
+```
+
+Direct `verify → implement` transitions remain blocked so a failed loop cannot silently discard evidence.
 
 ## Evidence boundary
 

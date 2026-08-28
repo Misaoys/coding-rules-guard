@@ -21,6 +21,6 @@ description: 阶段 3：执行不可绕过的真实验证，输出短证据卡�
 
 至少记录成功路径和一个关键失败/边界路径。用 `guard.py record-evidence` 分别记录，随后用 `guard.py set-result` 写入 `pass / pass_with_gaps / blocked / fail`。缺少目标层证据时必须写明 GAP；只有用户明确接受缺口后才能对 `pass_with_gaps` 使用 `--authorize-gaps`。
 
-若影响评估指出调用方、相邻功能或公共契约可能受影响，覆盖风险最高的未受影响路径；无法覆盖时如实记录 GAP。返工后清除旧结果并重新记录受影响证据，不以先前通过代替复检。
+若影响评估指出调用方、相邻功能或公共契约可能受影响，覆盖风险最高的未受影响路径；无法覆盖时如实记录 GAP。确认实现缺陷时先记录失败证据并设置 `fail`，再执行 `guard.py rework --reason <原因>` 返回 Implement；命令会清除失效结果、证据和授权，修改后必须重新进入 Verify，不以先前通过代替复检。
 
 验证通过后：无正式交付需求就 `transition --to complete`；需要 Git、安装、发布或正式交付就 `transition --to deliver`。只输出：`STATE / ENTRY / COMMAND / OBSERVED / EVIDENCE_LEVEL / RESULT / GAP`。

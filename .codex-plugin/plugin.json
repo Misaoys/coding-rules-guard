@@ -1,6 +1,6 @@
 {
   "name": "coding-rules-guard",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Risk-routed coding workflow with evidence-first validation, executable phase gates, and honest impact disclosure.",
   "author": {
     "name": "Misaoys"

@@ -27,4 +27,4 @@
 
 ## 阶段
 
-`plan → implement → verify → complete`，只有需要 Git、安装、发布、版本核对或正式交付时走 `verify → deliver → complete`。使用插件根目录 `scripts/guard.py` 记录状态和校验转换；状态文件放在任务临时目录，不写入或暂存到业务仓库。
+正常路径是 `plan → implement → verify → complete`；只有需要 Git、安装、发布、版本核对或正式交付时走 `verify → deliver → complete`。Verify 确认实现缺陷后，先记录失败证据，再执行 `guard.py rework --reason <原因>` 返回 Implement；该命令会把结果重置为 pending，清除已失效证据、GAP 授权和交付审计，并保留返工次数与原因。普通 `transition` 不允许任意倒退。状态文件放在任务临时目录，不写入或暂存到业务仓库。

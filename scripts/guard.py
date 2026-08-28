@@ -79,6 +79,12 @@ def validate_shape(state: dict[str, Any]) -> None:
         errors.append("risk.details must be an array")
     if state.get("result") not in RESULTS:
         errors.append("result is invalid")
+    rework_count = state.get("rework_count", 0)
+    if not isinstance(rework_count, int) or isinstance(rework_count, bool) or rework_count < 0:
+        errors.append("rework_count must be a non-negative integer")
+    rework_reason = state.get("last_rework_reason")
+    if rework_reason is not None and (not isinstance(rework_reason, str) or not rework_reason.strip()):
+        errors.append("last_rework_reason must be null or a non-empty string")
     for key in ("write_scope", "changed_files", "evidence", "gaps"):
         if not isinstance(state.get(key), list):
             errors.append(f"{key} must be an array")
@@ -227,6 +233,8 @@ def command_init(args: argparse.Namespace) -> None:
         "delivery_required": args.delivery_required,
         "gaps_authorized": False,
         "delivery_audit": None,
+        "rework_count": 0,
+        "last_rework_reason": None,
     }
     validate_shape(state)
     save_state(args.state, state)
@@ -239,6 +247,37 @@ def command_transition(args: argparse.Namespace) -> None:
     state["phase"] = args.to
     save_state(args.state, state)
     emit({"ok": True, "phase": args.to, "state": str(args.state)})
+
+
+def command_rework(args: argparse.Namespace) -> None:
+    state = load_state(args.state)
+    if state["phase"] != "verify":
+        raise GateError("WRONG_PHASE", ["rework requires verify phase"])
+    if state["result"] != "fail" and not any(item.get("result") == "fail" for item in state["evidence"]):
+        raise GateError("REWORK_NOT_JUSTIFIED", ["record failed verification evidence before rework"])
+    reason = args.reason.strip()
+    if not reason:
+        raise GateError("REWORK_REASON_REQUIRED", ["--reason must be non-empty"])
+
+    state["phase"] = "implement"
+    state["result"] = "pending"
+    state["evidence"] = []
+    state["gaps"] = []
+    state["gaps_authorized"] = False
+    state["delivery_audit"] = None
+    state["rework_count"] = int(state.get("rework_count", 0)) + 1
+    state["last_rework_reason"] = reason
+    validate_shape(state)
+    save_state(args.state, state)
+    emit(
+        {
+            "ok": True,
+            "phase": state["phase"],
+            "result": state["result"],
+            "rework_count": state["rework_count"],
+            "state": str(args.state),
+        }
+    )
 
 
 def command_set_changes(args: argparse.Namespace) -> None:
@@ -325,6 +364,11 @@ def build_parser() -> argparse.ArgumentParser:
     transition.add_argument("--state", type=Path, required=True)
     transition.add_argument("--to", choices=("implement", "verify", "deliver", "complete"), required=True)
     transition.set_defaults(handler=command_transition)
+
+    rework = subparsers.add_parser("rework", help="return failed verification to implementation")
+    rework.add_argument("--state", type=Path, required=True)
+    rework.add_argument("--reason", required=True)
+    rework.set_defaults(handler=command_rework)
 
     changes = subparsers.add_parser("set-changes", help="record changed files")
     changes.add_argument("--state", type=Path, required=True)

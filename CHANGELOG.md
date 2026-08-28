@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 - 2026-08-28
+
+- Added a guarded Verify-to-Implement rework loop.
+- Rework now resets stale results, evidence, gaps authorization, and delivery audit state.
+- Added auditable rework count and reason fields while keeping direct backward transitions blocked.
+
 ## 0.2.0 - 2026-08-28
 
 - Added machine-readable run state and deterministic phase-transition gates.

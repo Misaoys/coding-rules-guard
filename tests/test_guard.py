@@ -143,6 +143,66 @@ class GuardCliTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertEqual(payload["code"], "TRANSITION_BLOCKED")
 
+    def test_rework_returns_failed_verify_to_implement_and_resets_stale_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = Path(temp_dir) / "state.json"
+            commands = [
+                ("init", "--state", str(state), "--mode", "FAST", "--goal", "repair", "--write", "src/a.py", "--impact", "no_known_impact"),
+                ("transition", "--state", str(state), "--to", "implement"),
+                ("set-changes", "--state", str(state), "--file", "src/a.py"),
+                ("transition", "--state", str(state), "--to", "verify"),
+                ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "runtime", "--command", "run", "--observed", "bug reproduced", "--level", "test", "--result", "fail"),
+                ("set-result", "--state", str(state), "--result", "fail", "--gap", "stale gap"),
+            ]
+            for command in commands:
+                result = self.run_guard(*command)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            stale = json.loads(state.read_text(encoding="utf-8"))
+            stale["gaps_authorized"] = True
+            stale["delivery_audit"] = {"passed": True, "repo": "stale", "checked_files": ["src/a.py"]}
+            state.write_text(json.dumps(stale), encoding="utf-8")
+            result = self.run_guard(
+                "rework", "--state", str(state), "--reason", "implementation defect confirmed"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            payload = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(payload["phase"], "implement")
+            self.assertEqual(payload["result"], "pending")
+            self.assertEqual(payload["evidence"], [])
+            self.assertEqual(payload["gaps"], [])
+            self.assertFalse(payload["gaps_authorized"])
+            self.assertIsNone(payload["delivery_audit"])
+            self.assertEqual(payload["rework_count"], 1)
+            self.assertEqual(payload["last_rework_reason"], "implementation defect confirmed")
+
+            result = self.run_guard("set-changes", "--state", str(state), "--file", "src/a.py")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            result = self.run_guard("transition", "--state", str(state), "--to", "verify")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_rework_requires_failed_evidence_and_direct_back_transition_stays_blocked(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = Path(temp_dir) / "state.json"
+            commands = [
+                ("init", "--state", str(state), "--mode", "FAST", "--goal", "repair", "--write", "src/a.py", "--impact", "no_known_impact"),
+                ("transition", "--state", str(state), "--to", "implement"),
+                ("set-changes", "--state", str(state), "--file", "src/a.py"),
+                ("transition", "--state", str(state), "--to", "verify"),
+            ]
+            for command in commands:
+                result = self.run_guard(*command)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            result = self.run_guard("rework", "--state", str(state), "--reason", "no failure recorded")
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "REWORK_NOT_JUSTIFIED")
+
+            result = self.run_guard("transition", "--state", str(state), "--to", "implement")
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "INVALID_TRANSITION")
+
     def test_delivery_audit_checks_real_git_scope(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

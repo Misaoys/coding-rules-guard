@@ -11,7 +11,7 @@ import re
 import subprocess
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
@@ -21,10 +21,11 @@ IMPACTS = {"no_known_impact", "known_impact", "unverified"}
 RESULTS = {"pending", "pass", "pass_with_gaps", "blocked", "fail"}
 LEVELS = {"source", "test", "browser", "installed", "host", "production"}
 REVIEW_RESULTS = {"pass", "fail", "blocked"}
-CURRENT_SCHEMA_VERSION = 3
-SUPPORTED_SCHEMA_VERSIONS = {1, 2, CURRENT_SCHEMA_VERSION}
+CURRENT_SCHEMA_VERSION = 4
+SUPPORTED_SCHEMA_VERSIONS = {1, 2, 3, CURRENT_SCHEMA_VERSION}
 REWORK_WARN_AT = 2
 REWORK_REPLAN_AT = 3
+PLAN_RECORD_MAX_AGE = timedelta(hours=24)
 MODEL_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "model-profiles.json"
 SECRET_NAME_PATTERNS = (".env", "*.pem", "*.p12", "*.pfx", "id_rsa", "id_ed25519")
 SECRET_CONTENT = re.compile(
@@ -68,6 +69,62 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def read_markdown_content(args: argparse.Namespace) -> str:
+    """Read non-empty UTF-8 Markdown from an explicit file or standard input."""
+    if args.content_file is not None:
+        try:
+            content = args.content_file.read_text(encoding="utf-8")
+        except FileNotFoundError as exc:
+            raise GateError("PLAN_CONTENT_NOT_FOUND", [str(args.content_file)]) from exc
+        except OSError as exc:
+            raise GateError("PLAN_CONTENT_UNREADABLE", [str(exc)]) from exc
+    else:
+        content = sys.stdin.read()
+    content = content.lstrip("\ufeff").strip()
+    if not content:
+        raise GateError("PLAN_CONTENT_EMPTY", ["Markdown content must not be empty"])
+    return content + "\n"
+
+
+def replace_markdown_file(path: Path, content: str) -> None:
+    """Atomically replace an existing plan document without leaving a partial file."""
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def command_write_plan(args: argparse.Namespace) -> None:
+    content = read_markdown_content(args)
+    try:
+        args.file.parent.mkdir(parents=True, exist_ok=True)
+        with args.file.open("x", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+    except FileExistsError as exc:
+        raise GateError("PLAN_FILE_EXISTS", [str(args.file), "use prepend-requirement for a new requirement"]) from exc
+    except OSError as exc:
+        raise GateError("PLAN_FILE_UNWRITABLE", [str(exc)]) from exc
+    emit({"ok": True, "action": "write-plan", "plan_file": str(args.file)})
+
+
+def command_prepend_requirement(args: argparse.Namespace) -> None:
+    content = read_markdown_content(args)
+    try:
+        existing = args.file.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise GateError("PLAN_FILE_NOT_FOUND", [str(args.file), "write the initial Plan first"]) from exc
+    except OSError as exc:
+        raise GateError("PLAN_FILE_UNREADABLE", [str(exc)]) from exc
+    try:
+        replace_markdown_file(args.file, content + "\n---\n\n" + existing)
+    except OSError as exc:
+        raise GateError("PLAN_FILE_UNWRITABLE", [str(exc)]) from exc
+    emit({"ok": True, "action": "prepend-requirement", "plan_file": str(args.file)})
+
+
 def load_model_config() -> dict[str, Any]:
     """Load the bundled role profiles without claiming that a process used them."""
     try:
@@ -79,28 +136,41 @@ def load_model_config() -> dict[str, Any]:
 
     if not isinstance(config, dict):
         raise GateError("MODEL_CONFIG_INVALID", ["config must be an object"])
+    if config.get("schema_version") != 4:
+        raise GateError("MODEL_CONFIG_INVALID", ["schema_version must be 4"])
     delegation = config.get("delegation")
     profiles = config.get("profiles")
     if not isinstance(delegation, dict) or not isinstance(profiles, dict):
         raise GateError("MODEL_CONFIG_INVALID", ["delegation and profiles are required objects"])
 
-    # 0.4.x used default_profile. Accept it for the loader, while new config
-    # explicitly names executor and reviewer roles.
-    executor_name = delegation.get("executor_profile") or delegation.get("default_profile")
-    reviewer_name = delegation.get("reviewer_profile")
+    # Executor is a fixed protected role. Planner and reviewer use the
+    # current session's main model and must be recorded dynamically rather
+    # than being silently substituted with fixed models.
+    role_names = {
+        "planner": delegation.get("planner_profile"),
+        "executor": delegation.get("executor_profile"),
+        "reviewer": delegation.get("reviewer_profile"),
+    }
     errors: list[str] = []
-    if not isinstance(executor_name, str) or not executor_name.strip():
-        errors.append("delegation.executor_profile is required")
-    if not isinstance(reviewer_name, str) or not reviewer_name.strip():
-        errors.append("delegation.reviewer_profile is required")
+    for role, name in role_names.items():
+        if not isinstance(name, str) or not name.strip():
+            errors.append(f"delegation.{role}_profile is required")
 
     normalized_profiles: dict[str, dict[str, str]] = {}
-    for role, name in (("executor", executor_name), ("reviewer", reviewer_name)):
+    for role, name in role_names.items():
         if not isinstance(name, str) or not name.strip():
             continue
         profile = profiles.get(name)
         if not isinstance(profile, dict):
             errors.append(f"{role} profile {name!r} is missing")
+            continue
+        source = profile.get("source")
+        is_session_main = role in {"planner", "reviewer"} and source == "session_main"
+        if source is not None and not is_session_main:
+            errors.append(f"profile {name!r}.source is invalid for {role}")
+            continue
+        if is_session_main:
+            normalized_profiles[name] = {"source": "session_main"}
             continue
         model = profile.get("model")
         effort = profile.get("reasoning_effort")
@@ -114,8 +184,9 @@ def load_model_config() -> dict[str, Any]:
         raise GateError("MODEL_CONFIG_INVALID", errors)
     return {
         "delegation": {
-            "executor_profile": executor_name,
-            "reviewer_profile": reviewer_name,
+            "planner_profile": role_names["planner"],
+            "executor_profile": role_names["executor"],
+            "reviewer_profile": role_names["reviewer"],
         },
         "profiles": normalized_profiles,
     }
@@ -124,6 +195,112 @@ def load_model_config() -> dict[str, Any]:
 def configured_role(config: dict[str, Any], role: str) -> tuple[str, dict[str, str]]:
     name = config["delegation"][f"{role}_profile"]
     return name, config["profiles"][name]
+
+
+def is_session_main_profile(profile: dict[str, str]) -> bool:
+    return profile.get("source") == "session_main"
+
+
+def compute_plan_fingerprint(state: dict[str, Any]) -> str:
+    """Bind a recorded Plan to the run identity and all Plan-controlled fields."""
+    if state.get("schema_version") != CURRENT_SCHEMA_VERSION:
+        raise GateError("PLAN_STATE_UPGRADE_REQUIRED", ["plan fingerprints require schema v4"])
+    baseline = state.get("git_baseline")
+    if not isinstance(baseline, dict) or not isinstance(baseline.get("head"), str):
+        raise GateError("PLAN_STATE_INVALID", ["git_baseline.head is required for the Plan fingerprint"])
+    payload = {
+        "run_id": state.get("run_id"),
+        "repo": state.get("repo"),
+        "baseline_head": baseline["head"],
+        "mode": state.get("mode"),
+        "goal": state.get("goal"),
+        "write_scope": state.get("write_scope"),
+        "risk": state.get("risk"),
+        "delivery_required": state.get("delivery_required"),
+        "plan_revision": state.get("plan_revision"),
+    }
+    if "plan_file" in state:
+        payload["plan_file"] = state.get("plan_file")
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def ensure_plan_record(state: dict[str, Any]) -> list[str]:
+    """Require a current, configured, non-expired planner record before WRITE."""
+    errors: list[str] = []
+    if state.get("schema_version") != CURRENT_SCHEMA_VERSION:
+        return ["PLAN_STATE_UPGRADE_REQUIRED: plan -> implement requires schema v4"]
+    try:
+        config = load_model_config()
+        planner_name, planner = configured_role(config, "planner")
+    except GateError as exc:
+        return [f"planner configuration unavailable: {detail}" for detail in exc.details]
+
+    if state.get("planner_profile") != planner_name:
+        errors.append(
+            f"planner profile mismatch: state={state.get('planner_profile')!r}, configured={planner_name!r}"
+        )
+    record = state.get("plan_record")
+    if not isinstance(record, dict):
+        return errors + ["a current planner record is required before implementation"]
+    if record.get("profile") != planner_name:
+        errors.append("plan record does not use the configured planner profile")
+    if is_session_main_profile(planner):
+        if not isinstance(record.get("model"), str) or not record["model"].strip():
+            errors.append("session-main Plan record must identify the current main model")
+        if not isinstance(record.get("reasoning_effort"), str) or not record["reasoning_effort"].strip():
+            errors.append("session-main Plan record must identify the current main reasoning effort")
+    else:
+        if record.get("model") != planner["model"]:
+            errors.append("plan record model does not match the configured planner profile")
+        if record.get("reasoning_effort") != planner["reasoning_effort"]:
+            errors.append("plan record reasoning effort does not match the configured planner profile")
+    if not review_timestamp_is_valid(record.get("recorded_at")):
+        errors.append("plan record must contain a timezone-aware recorded_at timestamp")
+    else:
+        try:
+            recorded_at = datetime.fromisoformat(record["recorded_at"])
+            now = datetime.now(recorded_at.tzinfo)
+            if now - recorded_at > PLAN_RECORD_MAX_AGE:
+                errors.append("PLAN_RECORD_EXPIRED: planner record is older than 24 hours")
+        except (TypeError, ValueError):
+            errors.append("plan record recorded_at is invalid")
+    if record.get("plan_revision") != state.get("plan_revision"):
+        errors.append("PLAN_RECORD_EXPIRED: plan record revision no longer matches the current Plan")
+    try:
+        current_plan_fingerprint = compute_plan_fingerprint(state)
+    except GateError as exc:
+        errors.extend(f"PLAN_STALE: {exc.code}: {detail}" for detail in exc.details)
+    else:
+        if record.get("plan_fingerprint") != current_plan_fingerprint:
+            errors.append("PLAN_STALE: plan fingerprint no longer matches the current Plan")
+    return errors
+
+
+def ensure_plan_file_binding(state: dict[str, Any]) -> None:
+    """Reject completion if the state-bound Plan file changed after Plan recording."""
+    if "plan_file" not in state:
+        return
+    record = state.get("plan_record")
+    if not isinstance(record, dict):
+        raise GateError("PLAN_FILE_STALE", ["a recorded Plan is required to delete its Plan file"])
+    if record.get("plan_fingerprint") != compute_plan_fingerprint(state):
+        raise GateError("PLAN_FILE_STALE", ["the bound Plan file no longer matches the recorded Plan"])
+
+
+def delete_plan_file(state: dict[str, Any]) -> str | None:
+    plan_file = state.get("plan_file")
+    if plan_file is None:
+        return None
+    path = Path(plan_file)
+    try:
+        if path.exists():
+            if not path.is_file():
+                raise GateError("PLAN_FILE_DELETE_FAILED", [f"Plan path is not a file: {path}"])
+            path.unlink()
+    except OSError as exc:
+        raise GateError("PLAN_FILE_DELETE_FAILED", [str(exc)]) from exc
+    return str(path)
 
 
 def review_is_required(state: dict[str, Any]) -> bool:
@@ -158,15 +335,21 @@ def ensure_review(state: dict[str, Any]) -> list[str]:
         )
     review = state.get("review")
     if not isinstance(review, dict):
-        return errors + ["an independent reviewer record is required"]
+        return errors + ["a reviewer record is required"]
     if review.get("result") != "pass":
         errors.append("independent reviewer result must be pass")
     if review.get("profile") != reviewer_name:
         errors.append("review record does not use the configured reviewer profile")
-    if review.get("model") != reviewer["model"]:
-        errors.append("review record model does not match the configured reviewer profile")
-    if review.get("reasoning_effort") != reviewer["reasoning_effort"]:
-        errors.append("review record reasoning effort does not match the configured reviewer profile")
+    if is_session_main_profile(reviewer):
+        if not isinstance(review.get("model"), str) or not review["model"].strip():
+            errors.append("session-main review record must identify the current main model")
+        if not isinstance(review.get("reasoning_effort"), str) or not review["reasoning_effort"].strip():
+            errors.append("session-main review record must identify the current main reasoning effort")
+    else:
+        if review.get("model") != reviewer["model"]:
+            errors.append("review record model does not match the configured reviewer profile")
+        if review.get("reasoning_effort") != reviewer["reasoning_effort"]:
+            errors.append("review record reasoning effort does not match the configured reviewer profile")
     if not review_timestamp_is_valid(review.get("reviewed_at")):
         errors.append("review record must contain a timezone-aware reviewed_at timestamp")
     try:
@@ -204,7 +387,7 @@ def validate_shape(state: dict[str, Any]) -> None:
     errors: list[str] = []
     schema_version = state.get("schema_version")
     if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
-        errors.append("schema_version must be 1, 2, or 3")
+        errors.append("schema_version must be 1, 2, 3, or 4")
     if state.get("mode") not in {"FAST", "FULL"}:
         errors.append("mode must be FAST or FULL")
     if state.get("phase") not in PHASES:
@@ -230,9 +413,13 @@ def validate_shape(state: dict[str, Any]) -> None:
     plan_revision = state.get("plan_revision", 1)
     if not isinstance(plan_revision, int) or isinstance(plan_revision, bool) or plan_revision < 1:
         errors.append("plan_revision must be a positive integer")
+    if "plan_file" in state:
+        plan_file = state.get("plan_file")
+        if plan_file is not None and (not isinstance(plan_file, str) or not Path(plan_file).is_absolute()):
+            errors.append("plan_file must be null or an absolute path")
     if not isinstance(state.get("replan_required", False), bool):
         errors.append("replan_required must be a boolean")
-    if schema_version in {2, 3}:
+    if schema_version in {2, 3, 4}:
         repo = state.get("repo")
         baseline = state.get("git_baseline")
         if not isinstance(repo, str) or not Path(repo).is_absolute():
@@ -241,9 +428,9 @@ def validate_shape(state: dict[str, Any]) -> None:
             errors.append("git_baseline.head is required")
         elif not isinstance(baseline.get("files"), dict):
             errors.append("git_baseline.files must be an object")
-        elif schema_version == 3 and not isinstance(baseline.get("content_files"), dict):
+        elif schema_version in {3, 4} and not isinstance(baseline.get("content_files"), dict):
             errors.append("git_baseline.content_files must be an object")
-        elif schema_version == 3 and not isinstance(baseline.get("index_files"), dict):
+        elif schema_version in {3, 4} and not isinstance(baseline.get("index_files"), dict):
             errors.append("git_baseline.index_files must be an object")
         if state.get("change_detection") != "git_baseline":
             errors.append("change_detection must be git_baseline")
@@ -269,7 +456,7 @@ def validate_shape(state: dict[str, Any]) -> None:
                     errors.append("gap_authorization.authorized_at is invalid")
         if bool(state.get("gaps_authorized")) != (authorization is not None):
             errors.append("gaps_authorized must match gap_authorization")
-    if schema_version == 3:
+    if schema_version in {3, 4}:
         required_review_fields = {"review_required", "executor_profile", "reviewer_profile", "review"}
         missing_review_fields = sorted(required_review_fields - state.keys())
         if missing_review_fields:
@@ -311,6 +498,40 @@ def validate_shape(state: dict[str, Any]) -> None:
                     errors.append("review.result is invalid")
                 if "reviewed_at" in review and not review_timestamp_is_valid(review.get("reviewed_at")):
                     errors.append("review.reviewed_at must be timezone-aware")
+    if schema_version == CURRENT_SCHEMA_VERSION:
+        required_plan_fields = {"planner_profile", "plan_record"}
+        missing_plan_fields = sorted(required_plan_fields - state.keys())
+        if missing_plan_fields:
+            errors.append("missing plan fields: " + ", ".join(missing_plan_fields))
+        planner_profile = state.get("planner_profile")
+        if not isinstance(planner_profile, str) or not planner_profile.strip():
+            errors.append("planner_profile must be a non-empty string")
+        plan_record = state.get("plan_record")
+        if plan_record is not None:
+            if not isinstance(plan_record, dict):
+                errors.append("plan_record must be an object or null")
+            else:
+                required_plan_record = {
+                    "profile",
+                    "model",
+                    "reasoning_effort",
+                    "recorded_at",
+                    "plan_revision",
+                    "plan_fingerprint",
+                }
+                missing_plan_record = sorted(required_plan_record - plan_record.keys())
+                if missing_plan_record:
+                    errors.append("missing plan record fields: " + ", ".join(missing_plan_record))
+                for field in ("profile", "model", "reasoning_effort", "recorded_at", "plan_fingerprint"):
+                    if field in plan_record and (
+                        not isinstance(plan_record[field], str) or not plan_record[field].strip()
+                    ):
+                        errors.append(f"plan_record.{field} must be a non-empty string")
+                if "recorded_at" in plan_record and not review_timestamp_is_valid(plan_record.get("recorded_at")):
+                    errors.append("plan_record.recorded_at must be timezone-aware")
+                plan_record_revision = plan_record.get("plan_revision")
+                if not isinstance(plan_record_revision, int) or isinstance(plan_record_revision, bool) or plan_record_revision < 1:
+                    errors.append("plan_record.plan_revision must be a positive integer")
     for key in ("write_scope", "changed_files", "evidence", "gaps"):
         if not isinstance(state.get(key), list):
             errors.append(f"{key} must be an array")
@@ -387,6 +608,7 @@ def check_transition(state: dict[str, Any], target: str) -> None:
             errors.append("risk impact must be assessed before implementation")
         if state.get("replan_required", False):
             errors.append("revise-plan is required before implementation")
+        errors.extend(ensure_plan_record(state))
         errors.extend(ensure_executor_profile(state))
     elif target == "verify":
         if not state["changed_files"]:
@@ -401,7 +623,7 @@ def check_transition(state: dict[str, Any], target: str) -> None:
             errors.append("verification result must be pass or pass_with_gaps")
         if state["result"] == "pass_with_gaps" and (not state["gaps"] or not state["gaps_authorized"]):
             errors.append("pass_with_gaps requires listed and explicitly authorized gaps")
-        if state.get("schema_version") in {2, 3} and state["result"] == "pass_with_gaps":
+        if state.get("schema_version") in {2, 3, 4} and state["result"] == "pass_with_gaps":
             if not isinstance(state.get("gap_authorization"), dict):
                 errors.append("pass_with_gaps requires a separate gap authorization record")
         if state["risk"]["impact"] == "unverified":
@@ -531,7 +753,7 @@ def task_delta_files(state: dict[str, Any]) -> list[str]:
     if schema_version == 2:
         raise GateError(
             "REVIEW_STATE_UPGRADE_REQUIRED",
-            ["v2 state cannot bind review across a changed Git HEAD; rebuild the run with schema v3"],
+            ["v2 state cannot bind review across a changed Git HEAD; rebuild the run with schema v4"],
         )
     if not git_is_ancestor(repo, baseline["head"], current_head):
         raise GateError("GIT_BASELINE_MOVED", ["baseline HEAD is not an ancestor of current HEAD"])
@@ -539,7 +761,7 @@ def task_delta_files(state: dict[str, Any]) -> list[str]:
     committed = set(git_lines(repo, "diff", "--name-only", "--no-renames", baseline["head"], current_head))
     baseline_content = baseline.get("content_files")
     if not isinstance(baseline_content, dict):
-        raise GateError("REVIEW_STATE_UPGRADE_REQUIRED", ["v3 baseline content fingerprints are missing"])
+        raise GateError("REVIEW_STATE_UPGRADE_REQUIRED", ["baseline content fingerprints are missing; rebuild with schema v4"])
     residual: set[str] = set()
     for rel in actual_git_files(repo):
         if rel in baseline_content and filesystem_path_fingerprint(repo, rel) == baseline_content[rel]:
@@ -601,7 +823,7 @@ def fingerprint_identities(baseline_head: str, identities: list[tuple[str, str]]
 
 
 def compute_task_fingerprint(state: dict[str, Any]) -> str:
-    if state.get("schema_version") not in {2, 3}:
+    if state.get("schema_version") not in {2, 3, 4}:
         raise GateError("REVIEW_STATE_UPGRADE_REQUIRED", ["state lacks a reviewable Git baseline"])
     repo = Path(state["repo"])
     baseline_head = state["git_baseline"]["head"]
@@ -629,7 +851,7 @@ def compute_task_fingerprint(state: dict[str, Any]) -> str:
         if state.get("schema_version") == 2:
             raise GateError(
                 "REVIEW_STATE_UPGRADE_REQUIRED",
-                ["v2 state cannot bind review to a final commit tree; rebuild with schema v3"],
+                ["v2 state cannot bind review to a final commit tree; rebuild with schema v4"],
             )
         if not git_is_ancestor(repo, baseline_head, current_head):
             raise GateError("GIT_BASELINE_MOVED", ["baseline HEAD is not an ancestor of current HEAD"])
@@ -672,10 +894,17 @@ def command_init(args: argparse.Namespace) -> None:
     repo = git_repo_root(args.repo)
     git_baseline = capture_git_baseline(repo)
     config = load_model_config()
+    planner_name, _ = configured_role(config, "planner")
     executor_name, _ = configured_role(config, "executor")
     reviewer_name, _ = configured_role(config, "reviewer")
     write_scope = sorted({normalize_path(item) for item in args.write})
     review_required = bool(write_scope)
+    plan_file = None
+    if args.plan_file is not None:
+        plan_path = args.plan_file.absolute()
+        if not plan_path.is_file():
+            raise GateError("PLAN_FILE_NOT_FOUND", [str(plan_path), "write the Plan before init"])
+        plan_file = str(plan_path)
     state = {
         "schema_version": CURRENT_SCHEMA_VERSION,
         "run_id": args.run_id or str(uuid.uuid4()),
@@ -697,10 +926,13 @@ def command_init(args: argparse.Namespace) -> None:
         "rework_streak": 0,
         "replan_required": False,
         "plan_revision": 1,
+        "plan_file": plan_file,
         "repo": str(repo),
         "git_baseline": git_baseline,
         "change_detection": "git_baseline",
         "review_required": review_required,
+        "planner_profile": planner_name,
+        "plan_record": None,
         "executor_profile": executor_name if review_required else None,
         "reviewer_profile": reviewer_name,
         "review": None,
@@ -710,14 +942,71 @@ def command_init(args: argparse.Namespace) -> None:
     emit({"ok": True, "state": str(args.state), "run_id": state["run_id"], "phase": state["phase"]})
 
 
+def command_record_plan(args: argparse.Namespace) -> None:
+    state = load_state(args.state)
+    if state["phase"] != "plan":
+        raise GateError("WRONG_PHASE", ["record-plan requires plan phase"])
+    if state.get("schema_version") != CURRENT_SCHEMA_VERSION:
+        raise GateError("PLAN_STATE_UPGRADE_REQUIRED", ["record-plan requires schema v4"])
+    if state.get("replan_required", False):
+        raise GateError("REPLAN_REQUIRED", ["revise-plan is required before recording the revised Plan"])
+
+    config = load_model_config()
+    planner_name, planner = configured_role(config, "planner")
+    if state.get("planner_profile") != planner_name:
+        raise GateError(
+            "PLAN_PROFILE_MISMATCH",
+            [f"state planner profile is {state.get('planner_profile')!r}; configured planner profile is {planner_name!r}"],
+        )
+    supplied_profile = args.profile
+    if supplied_profile and supplied_profile != planner_name:
+        raise GateError("PLAN_PROFILE_MISMATCH", [f"configured planner profile is {planner_name!r}"])
+    if is_session_main_profile(planner):
+        if not args.model or not args.model.strip():
+            raise GateError("SESSION_MAIN_MODEL_REQUIRED", ["record the current session main model with --model"])
+        if not args.reasoning_effort or not args.reasoning_effort.strip():
+            raise GateError(
+                "SESSION_MAIN_REASONING_REQUIRED",
+                ["record the current session main reasoning effort with --reasoning-effort"],
+            )
+        planned_model = args.model.strip()
+        planned_effort = args.reasoning_effort.strip()
+    else:
+        if args.model and args.model != planner["model"]:
+            raise GateError("PLAN_PROFILE_MISMATCH", [f"configured planner model is {planner['model']!r}"])
+        if args.reasoning_effort and args.reasoning_effort != planner["reasoning_effort"]:
+            raise GateError(
+                "PLAN_PROFILE_MISMATCH",
+                [f"configured planner reasoning effort is {planner['reasoning_effort']!r}"],
+            )
+        planned_model = planner["model"]
+        planned_effort = planner["reasoning_effort"]
+
+    state["plan_record"] = {
+        "profile": planner_name,
+        "model": planned_model,
+        "reasoning_effort": planned_effort,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "plan_revision": state["plan_revision"],
+        "plan_fingerprint": compute_plan_fingerprint(state),
+    }
+    validate_shape(state)
+    save_state(args.state, state)
+    emit({"ok": True, "plan_record": state["plan_record"], "state": str(args.state)})
+
+
 def command_transition(args: argparse.Namespace) -> None:
     state = load_state(args.state)
     check_transition(state, args.to)
+    deleted_plan_file = None
+    if args.to == "complete":
+        ensure_plan_file_binding(state)
+        deleted_plan_file = delete_plan_file(state)
     state["phase"] = args.to
     if args.to in {"deliver", "complete"}:
         state["rework_streak"] = 0
     save_state(args.state, state)
-    emit({"ok": True, "phase": args.to, "state": str(args.state)})
+    emit({"ok": True, "phase": args.to, "plan_deleted": deleted_plan_file, "state": str(args.state)})
 
 
 def command_rework(args: argparse.Namespace) -> None:
@@ -756,6 +1045,8 @@ def command_rework(args: argparse.Namespace) -> None:
     if state["rework_streak"] >= REWORK_REPLAN_AT:
         state["phase"] = "plan"
         state["replan_required"] = True
+        if state.get("schema_version") == CURRENT_SCHEMA_VERSION:
+            state["plan_record"] = None
         payload["code"] = "REPLAN_REQUIRED"
     else:
         state["phase"] = "implement"
@@ -794,8 +1085,11 @@ def command_revise_plan(args: argparse.Namespace) -> None:
     state["delivery_audit"] = None
     if state.get("schema_version") == CURRENT_SCHEMA_VERSION:
         config = load_model_config()
+        planner_name, _ = configured_role(config, "planner")
         executor_name, _ = configured_role(config, "executor")
         reviewer_name, _ = configured_role(config, "reviewer")
+        state["planner_profile"] = planner_name
+        state["plan_record"] = None
         state["review_required"] = bool(revised_scope)
         state["executor_profile"] = executor_name if revised_scope else None
         state["reviewer_profile"] = reviewer_name
@@ -820,7 +1114,7 @@ def command_set_changes(args: argparse.Namespace) -> None:
     state = load_state(args.state)
     if state["phase"] != "implement":
         raise GateError("WRONG_PHASE", ["set-changes requires implement phase"])
-    if state["schema_version"] in {2, 3}:
+    if state["schema_version"] in {2, 3, 4}:
         if args.file:
             raise GateError("DECLARED_CHANGES_FORBIDDEN", ["v2 states derive changes from the Git baseline"])
         state["changed_files"] = task_git_files(state)
@@ -895,21 +1189,34 @@ def command_record_review(args: argparse.Namespace) -> None:
     supplied_profile = args.profile
     if supplied_profile and supplied_profile != reviewer_name:
         raise GateError("REVIEW_PROFILE_MISMATCH", [f"configured reviewer profile is {reviewer_name!r}"])
-    if args.model and args.model != reviewer["model"]:
-        raise GateError("REVIEW_PROFILE_MISMATCH", [f"configured reviewer model is {reviewer['model']!r}"])
-    if args.reasoning_effort and args.reasoning_effort != reviewer["reasoning_effort"]:
-        raise GateError(
-            "REVIEW_PROFILE_MISMATCH",
-            [f"configured reviewer reasoning effort is {reviewer['reasoning_effort']!r}"],
-        )
+    if is_session_main_profile(reviewer):
+        if not args.model or not args.model.strip():
+            raise GateError("SESSION_MAIN_MODEL_REQUIRED", ["record the current session main model with --model"])
+        if not args.reasoning_effort or not args.reasoning_effort.strip():
+            raise GateError(
+                "SESSION_MAIN_REASONING_REQUIRED",
+                ["record the current session main reasoning effort with --reasoning-effort"],
+            )
+        reviewed_model = args.model.strip()
+        reviewed_effort = args.reasoning_effort.strip()
+    else:
+        if args.model and args.model != reviewer["model"]:
+            raise GateError("REVIEW_PROFILE_MISMATCH", [f"configured reviewer model is {reviewer['model']!r}"])
+        if args.reasoning_effort and args.reasoning_effort != reviewer["reasoning_effort"]:
+            raise GateError(
+                "REVIEW_PROFILE_MISMATCH",
+                [f"configured reviewer reasoning effort is {reviewer['reasoning_effort']!r}"],
+            )
+        reviewed_model = reviewer["model"]
+        reviewed_effort = reviewer["reasoning_effort"]
     observed = args.observed.strip()
     if not observed:
         raise GateError("REVIEW_OBSERVED_REQUIRED", ["--observed must be non-empty"])
     reviewed_at = datetime.now(timezone.utc).isoformat()
     state["review"] = {
         "profile": reviewer_name,
-        "model": reviewer["model"],
-        "reasoning_effort": reviewer["reasoning_effort"],
+        "model": reviewed_model,
+        "reasoning_effort": reviewed_effort,
         "result": args.result,
         "observed": observed,
         "reviewed_at": reviewed_at,
@@ -950,7 +1257,7 @@ def command_audit(args: argparse.Namespace) -> None:
     if state["phase"] != "deliver":
         raise GateError("WRONG_PHASE", ["audit requires deliver phase"])
     repo = args.repo.resolve()
-    if state["schema_version"] in {2, 3}:
+    if state["schema_version"] in {2, 3, 4}:
         if repo != Path(state["repo"]).resolve():
             raise GateError("AUDIT_REPO_MISMATCH", [str(repo), state["repo"]])
         actual = task_git_files(state)
@@ -965,7 +1272,7 @@ def command_audit(args: argparse.Namespace) -> None:
         errors.append("out-of-scope git changes: " + ", ".join(outside))
     errors.extend(secret_findings(repo, actual))
     task_fingerprint = (
-        compute_task_fingerprint(state) if state.get("schema_version") in {2, 3} else "legacy-state"
+        compute_task_fingerprint(state) if state.get("schema_version") in {2, 3, 4} else "legacy-state"
     )
     if errors:
         state["delivery_audit"] = {
@@ -990,6 +1297,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
+    def add_markdown_content_source(command: argparse.ArgumentParser) -> None:
+        source = command.add_mutually_exclusive_group(required=True)
+        source.add_argument("--content-file", type=Path)
+        source.add_argument("--stdin", action="store_true")
+
+    write_plan = subparsers.add_parser("write-plan", help="create the canonical Plan Markdown file")
+    write_plan.add_argument("--file", type=Path, required=True)
+    add_markdown_content_source(write_plan)
+    write_plan.set_defaults(handler=command_write_plan)
+
+    prepend_requirement = subparsers.add_parser(
+        "prepend-requirement", help="place a new requirement above the existing Plan Markdown"
+    )
+    prepend_requirement.add_argument("--file", type=Path, required=True)
+    add_markdown_content_source(prepend_requirement)
+    prepend_requirement.set_defaults(handler=command_prepend_requirement)
+
     init = subparsers.add_parser("init", help="create a run state")
     init.add_argument("--state", type=Path, required=True)
     init.add_argument("--repo", type=Path, required=True)
@@ -999,8 +1323,16 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--write", action="append", default=[])
     init.add_argument("--impact", choices=sorted(IMPACTS), required=True)
     init.add_argument("--risk-detail", action="append", default=[])
+    init.add_argument("--plan-file", type=Path)
     init.add_argument("--delivery-required", action="store_true")
     init.set_defaults(handler=command_init)
+
+    plan = subparsers.add_parser("record-plan", help="record the configured planner's current Plan")
+    plan.add_argument("--state", type=Path, required=True)
+    plan.add_argument("--profile")
+    plan.add_argument("--model")
+    plan.add_argument("--reasoning-effort")
+    plan.set_defaults(handler=command_record_plan)
 
     transition = subparsers.add_parser("transition", help="validate and move to a phase")
     transition.add_argument("--state", type=Path, required=True)

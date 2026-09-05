@@ -1,4 +1,4 @@
 interface:
   display_name: "编码规则：规划"
   short_description: "选择 FAST/FULL、写入范围和验证门"
-  default_prompt: "使用 $coding-rules-plan 产出严格的 7 项 Plan 卡片，不修改文件或创建子代理。"
+  default_prompt: "使用 $coding-rules-plan 由当前会话主模型以 session_main 产出严格的 7 项 Plan 卡片，并记录实际模型与推理强度；不修改业务文件或创建子代理；需要改 Plan 时由当前主模型重新规划。"

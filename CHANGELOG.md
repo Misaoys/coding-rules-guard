@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.11.0 - 2026-09-05
+
+- Replaced the fixed GPT-5.6 Sol/xhigh planner with the current session's main model under the `session_main` planning role.
+- Require Plan records to name the current session model and reasoning effort; missing data blocks implementation without a fixed-model fallback.
+
+## 0.10.0 - 2026-09-05
+
+- Replaced the fixed GPT-5.6 Sol/xhigh reviewer with the current session's main model under the `session_main` audit role.
+- Require every review record to name the current session model and reasoning effort; missing data blocks completion without a fixed-model fallback.
+
+## 0.9.0 - 2026-09-04
+
+- Required an explicit contract, evidence gap, and named regression before a new test is allowed.
+- Restricted defensive code to observed failures, documented contracts, or explicit trust boundaries, and prohibited speculative fallbacks and catch-all handling.
+
+## 0.8.0 - 2026-08-30
+
+- Bound the task-work Plan Markdown path into new run states and Plan fingerprints.
+- Delete that file only after the complete gate passes; a blocked completion keeps the Plan for follow-up work.
+
+## 0.7.0 - 2026-08-30
+
+- Made the seven-section Plan a canonical Markdown file in the task work directory instead of a chat-only artifact.
+- Added `write-plan` for safe initial creation and `prepend-requirement` for adding later requirements above the existing Markdown without overwriting it.
+
+## 0.6.0 - 2026-08-29
+
+- Added the protected `planner_default` (`gpt-5.6-sol` + `xhigh`) role alongside the Luna executor and independent Sol reviewer; missing protected roles now block instead of silently falling back.
+- Added schema v4 run states with `planner_profile`, `plan_record`, `record-plan`, and a Plan fingerprint bound to run identity, repository baseline, Plan fields, delivery intent, and revision.
+- Required a current planner record and matching executor profile before `plan → implement`; configuration drift, Plan edits, expired revisions, and invalid timestamps block the gate.
+- Cleared planner records on the third consecutive rework and required `revise-plan` followed by a new `record-plan`; legacy v1-v3 Plan states fail closed.
+- Documented the strict Sol Plan → Luna WRITE → Verify → independent Sol Review chain, session-only read-only audits, and the local CLI's inability to prove real model identity cryptographically.
+
 ## 0.5.0 - 2026-08-29
 
 - Made `gpt-5.6-luna` with `max` reasoning the default executor for every WRITE task, including FAST and small changes; read-only tasks do not delegate.

@@ -1,4 +1,4 @@
 interface:
   display_name: "编码规则：真实验证"
   short_description: "记录真实证据、缺口和验证结果"
-  default_prompt: "使用 $coding-rules-verify 运行最小真实验证，并把成功、边界、结果和缺口写入状态。"
+  default_prompt: "使用 $coding-rules-verify 沿 Sol Plan → Luna WRITE → Verify → 当前会话主模型审核运行最小真实验证，并把成功、边界、结果、缺口与 session_main review 写入状态。"

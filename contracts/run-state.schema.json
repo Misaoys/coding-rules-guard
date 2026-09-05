@@ -27,12 +27,14 @@
     "change_detection",
     "delivery_audit",
     "review_required",
+    "planner_profile",
+    "plan_record",
     "executor_profile",
     "reviewer_profile",
     "review"
   ],
   "properties": {
-    "schema_version": { "const": 3 },
+    "schema_version": { "const": 4 },
     "run_id": { "type": "string", "minLength": 1 },
     "mode": { "enum": ["FAST", "FULL"] },
     "phase": { "enum": ["plan", "implement", "verify", "deliver", "complete"] },
@@ -84,6 +86,7 @@
     "rework_streak": { "type": "integer", "minimum": 0 },
     "replan_required": { "type": "boolean" },
     "plan_revision": { "type": "integer", "minimum": 1 },
+    "plan_file": { "type": ["string", "null"] },
     "repo": { "type": "string", "minLength": 1 },
     "git_baseline": {
       "type": "object",
@@ -107,6 +110,27 @@
     },
     "change_detection": { "const": "git_baseline" },
     "review_required": { "type": "boolean" },
+    "planner_profile": { "type": "string", "minLength": 1 },
+    "plan_record": {
+      "type": ["object", "null"],
+      "properties": {
+        "profile": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "reasoning_effort": { "type": "string", "minLength": 1 },
+        "recorded_at": { "type": "string", "format": "date-time" },
+        "plan_revision": { "type": "integer", "minimum": 1 },
+        "plan_fingerprint": { "type": "string", "minLength": 1 }
+      },
+      "required": [
+        "profile",
+        "model",
+        "reasoning_effort",
+        "recorded_at",
+        "plan_revision",
+        "plan_fingerprint"
+      ],
+      "additionalProperties": false
+    },
     "executor_profile": { "type": ["string", "null"], "minLength": 1 },
     "reviewer_profile": { "type": "string", "minLength": 1 },
     "review": {

@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,11 +85,11 @@ class GuardUnitTests(unittest.TestCase):
             guard.check_transition(state, "complete")
         state["gaps_authorized"] = True
         state["review_required"] = True
-        state["reviewer_profile"] = "reviewer_default"
+        state["reviewer_profile"] = "session_main"
         state["review"] = {
-            "profile": "reviewer_default",
-            "model": "gpt-5.6-sol",
-            "reasoning_effort": "xhigh",
+            "profile": "session_main",
+            "model": "gpt-test-main",
+            "reasoning_effort": "high",
             "result": "pass",
             "observed": "legacy state independently reviewed",
             "reviewed_at": "2026-08-29T00:00:00+00:00",
@@ -122,11 +123,31 @@ class GuardUnitTests(unittest.TestCase):
             guard.check_transition(state, "complete")
         self.assertIn("failed evidence", " ".join(raised.exception.details))
 
+    def test_missing_planner_configuration_blocks_without_fallback(self):
+        config = json.loads(guard.MODEL_CONFIG_PATH.read_text(encoding="utf-8"))
+        del config["delegation"]["planner_profile"]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "model-profiles.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with patch.object(guard, "MODEL_CONFIG_PATH", config_path):
+                with self.assertRaises(guard.GateError) as raised:
+                    guard.load_model_config()
+        self.assertEqual(raised.exception.code, "MODEL_CONFIG_INVALID")
+        self.assertIn("planner_profile", " ".join(raised.exception.details))
+
 
 class GuardCliTests(unittest.TestCase):
     def run_guard(self, *args):
+        command = list(args)
+        if command and command[0] in {"record-plan", "record-review"}:
+            if "--profile" not in command:
+                command.extend(("--profile", "session_main"))
+            if "--model" not in command:
+                command.extend(("--model", "gpt-test-main"))
+            if "--reasoning-effort" not in command:
+                command.extend(("--reasoning-effort", "high"))
         return subprocess.run(
-            [sys.executable, str(GUARD_PATH), *args], capture_output=True, text=True, encoding="utf-8"
+            [sys.executable, str(GUARD_PATH), *command], capture_output=True, text=True, encoding="utf-8"
         )
 
     def git(self, repo, *args):
@@ -149,6 +170,16 @@ class GuardCliTests(unittest.TestCase):
         self.git(repo, "commit", "-m", "initial")
         return repo, target
 
+    def create_planned_run(self, root, goal="plan gate"):
+        repo, target = self.create_repo(root)
+        state = root / "state.json"
+        result = self.run_guard(
+            "init", "--state", str(state), "--repo", str(repo), "--mode", "FAST",
+            "--goal", goal, "--write", "src/a.py", "--impact", "no_known_impact"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return repo, target, state
+
     def create_verified_run(self, root):
         repo, target = self.create_repo(root)
         state = root / "state.json"
@@ -158,13 +189,16 @@ class GuardCliTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         initialized = json.loads(state.read_text(encoding="utf-8"))
-        self.assertEqual(initialized["schema_version"], 3)
+        self.assertEqual(initialized["schema_version"], 4)
         self.assertTrue(initialized["review_required"])
+        self.assertEqual(initialized["planner_profile"], "session_main")
+        self.assertIsNone(initialized["plan_record"])
         self.assertEqual(initialized["executor_profile"], "executor_default")
-        self.assertEqual(initialized["reviewer_profile"], "reviewer_default")
+        self.assertEqual(initialized["reviewer_profile"], "session_main")
         self.assertIsNone(initialized["review"])
         target.write_text("value = 2\n", encoding="utf-8")
         commands = [
+            ("record-plan", "--state", str(state)),
             ("transition", "--state", str(state), "--to", "implement"),
             ("set-changes", "--state", str(state)),
             ("transition", "--state", str(state), "--to", "verify"),
@@ -176,6 +210,105 @@ class GuardCliTests(unittest.TestCase):
             result = self.run_guard(*command)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return repo, state
+
+    def test_plan_record_is_required_then_unlocks_implementation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _, target, state = self.create_planned_run(root)
+            target.write_text("value = 2\n", encoding="utf-8")
+            result = self.run_guard("transition", "--state", str(state), "--to", "implement")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("planner record", " ".join(json.loads(result.stdout)["details"]))
+
+            result = self.run_guard(
+                "record-plan", "--state", str(state), "--profile", "session_main",
+                "--model", "gpt-main-under-test", "--reasoning-effort", "high"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            record = json.loads(state.read_text(encoding="utf-8"))["plan_record"]
+            self.assertEqual(record["profile"], "session_main")
+            self.assertEqual(record["model"], "gpt-main-under-test")
+            self.assertEqual(record["reasoning_effort"], "high")
+            self.assertEqual(record["plan_revision"], 1)
+            self.assertTrue(record["plan_fingerprint"])
+            self.assertTrue(record["recorded_at"].endswith("+00:00"))
+
+            result = self.run_guard("transition", "--state", str(state), "--to", "implement")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_record_plan_rejects_wrong_profile_model_and_effort(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _, _, state = self.create_planned_run(root)
+            result = self.run_guard("record-plan", "--state", str(state), "--profile", "wrong-planner")
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "PLAN_PROFILE_MISMATCH")
+            self.assertIsNone(json.loads(state.read_text(encoding="utf-8"))["plan_record"])
+
+    def test_session_main_plan_requires_model_and_reasoning(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _, _, state = self.create_planned_run(root)
+            result = subprocess.run(
+                [sys.executable, str(GUARD_PATH), "record-plan", "--state", str(state)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "SESSION_MAIN_MODEL_REQUIRED")
+
+    def test_plan_record_blocks_tampered_fields_and_expired_revision(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _, _, state = self.create_planned_run(root)
+            result = self.run_guard("record-plan", "--state", str(state))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(state.read_text(encoding="utf-8"))
+
+            payload["goal"] = "tampered plan"
+            state.write_text(json.dumps(payload), encoding="utf-8")
+            result = self.run_guard("transition", "--state", str(state), "--to", "implement")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("PLAN_STALE", " ".join(json.loads(result.stdout)["details"]))
+
+            payload["goal"] = "plan gate"
+            payload["plan_revision"] = 2
+            state.write_text(json.dumps(payload), encoding="utf-8")
+            result = self.run_guard("transition", "--state", str(state), "--to", "implement")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("PLAN_RECORD_EXPIRED", " ".join(json.loads(result.stdout)["details"]))
+
+    def test_legacy_plan_states_fail_closed_for_implementation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _, _, state = self.create_planned_run(root)
+            result = self.run_guard("record-plan", "--state", str(state))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(state.read_text(encoding="utf-8"))
+            for schema_version in (1, 2, 3):
+                payload["schema_version"] = schema_version
+                payload["phase"] = "plan"
+                state.write_text(json.dumps(payload), encoding="utf-8")
+                result = self.run_guard("transition", "--state", str(state), "--to", "implement")
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("PLAN_STATE_UPGRADE_REQUIRED", " ".join(json.loads(result.stdout)["details"]))
+
+    def test_planner_configuration_drift_blocks_implementation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _, _, state_path = self.create_planned_run(root)
+            result = self.run_guard("record-plan", "--state", str(state_path))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            state = guard.load_state(state_path)
+            config = json.loads(guard.MODEL_CONFIG_PATH.read_text(encoding="utf-8"))
+            config["profiles"]["session_main"]["source"] = "invalid-source"
+            config_path = root / "model-profiles.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with patch.object(guard, "MODEL_CONFIG_PATH", config_path):
+                with self.assertRaises(guard.GateError) as raised:
+                    guard.check_transition(state, "implement")
+            self.assertIn("planner configuration unavailable", " ".join(raised.exception.details))
 
     def test_new_write_state_requires_an_independent_review(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -196,6 +329,8 @@ class GuardCliTests(unittest.TestCase):
                 "init", "--state", str(state), "--repo", str(repo), "--mode", "FAST",
                 "--goal", "executor gate", "--write", "src/a.py", "--impact", "no_known_impact"
             )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            result = self.run_guard("record-plan", "--state", str(state))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             payload = json.loads(state.read_text(encoding="utf-8"))
             payload["executor_profile"] = "wrong-executor"
@@ -222,24 +357,41 @@ class GuardCliTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(json.loads(state.read_text(encoding="utf-8"))["phase"], "implement")
 
-    def test_configured_sol_xhigh_review_allows_completion(self):
+    def test_session_main_review_allows_completion(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             _, state = self.create_verified_run(root)
             result = self.run_guard(
                 "record-review", "--state", str(state), "--result", "pass",
-                "--observed", "Sol xhigh independently checked the passing evidence"
+                "--observed", "current session main model checked the passing evidence",
+                "--profile", "session_main", "--model", "gpt-main-under-test", "--reasoning-effort", "high"
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             review = json.loads(state.read_text(encoding="utf-8"))["review"]
-            self.assertEqual(review["profile"], "reviewer_default")
-            self.assertEqual(review["model"], "gpt-5.6-sol")
-            self.assertEqual(review["reasoning_effort"], "xhigh")
+            self.assertEqual(review["profile"], "session_main")
+            self.assertEqual(review["model"], "gpt-main-under-test")
+            self.assertEqual(review["reasoning_effort"], "high")
             self.assertTrue(review["observed"])
             self.assertTrue(review["reviewed_at"].endswith("+00:00"))
             self.assertTrue(review["task_fingerprint"])
             result = self.run_guard("transition", "--state", str(state), "--to", "complete")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_session_main_review_requires_model_and_reasoning(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _, state = self.create_verified_run(root)
+            result = subprocess.run(
+                [
+                    sys.executable, str(GUARD_PATH), "record-review", "--state", str(state),
+                    "--result", "pass", "--observed", "review without session model",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "SESSION_MAIN_MODEL_REQUIRED")
 
     def test_review_becomes_stale_after_same_file_changes(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -291,13 +443,18 @@ class GuardCliTests(unittest.TestCase):
             root = Path(temp_dir)
             repo, target = self.create_repo(root)
             state = root / "state.json"
+            plan = root / "work" / "plan.md"
+            plan.parent.mkdir()
+            plan.write_text("### MODE\n\n`FAST`\n", encoding="utf-8")
             result = self.run_guard(
                 "init", "--state", str(state), "--repo", str(repo), "--mode", "FAST",
-                "--goal", "bounded", "--write", "src/a.py", "--impact", "no_known_impact"
+                "--goal", "bounded", "--write", "src/a.py", "--impact", "no_known_impact",
+                "--plan-file", str(plan)
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             target.write_text("value = 2\n", encoding="utf-8")
             commands = [
+                ("record-plan", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "implement"),
                 ("set-changes", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "verify"),
@@ -310,6 +467,8 @@ class GuardCliTests(unittest.TestCase):
             for command in commands:
                 result = self.run_guard(*command)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(json.loads(result.stdout)["plan_deleted"], str(plan.absolute()))
+            self.assertFalse(plan.exists())
             payload = json.loads(state.read_text(encoding="utf-8"))
             self.assertEqual(payload["phase"], "complete")
 
@@ -328,6 +487,25 @@ class GuardCliTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertEqual(payload["code"], "TRANSITION_BLOCKED")
 
+    def test_blocked_completion_keeps_the_attached_plan_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo, _ = self.create_repo(root)
+            state = root / "state.json"
+            plan = root / "work" / "plan.md"
+            plan.parent.mkdir()
+            plan.write_text("### MODE\n\n`FAST`\n", encoding="utf-8")
+            result = self.run_guard(
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FAST",
+                "--goal", "bounded", "--write", "src/a.py", "--impact", "no_known_impact",
+                "--plan-file", str(plan)
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            result = self.run_guard("transition", "--state", str(state), "--to", "complete")
+            self.assertEqual(result.returncode, 2)
+            self.assertTrue(plan.exists())
+
     def test_rework_returns_failed_verify_to_implement_and_resets_stale_state(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -340,6 +518,7 @@ class GuardCliTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             target.write_text("value = 2\n", encoding="utf-8")
             commands = [
+                ("record-plan", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "implement"),
                 ("set-changes", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "verify"),
@@ -393,6 +572,7 @@ class GuardCliTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             target.write_text("value = 2\n", encoding="utf-8")
             commands = [
+                ("record-plan", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "implement"),
                 ("set-changes", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "verify"),
@@ -420,6 +600,8 @@ class GuardCliTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             target.write_text("value = 2\n", encoding="utf-8")
+            result = self.run_guard("record-plan", "--state", str(state))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             result = self.run_guard("transition", "--state", str(state), "--to", "implement")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -446,6 +628,7 @@ class GuardCliTests(unittest.TestCase):
             self.assertEqual(payload["rework_count"], 3)
             self.assertEqual(payload["rework_streak"], 3)
             self.assertTrue(payload["replan_required"])
+            self.assertIsNone(payload["plan_record"])
 
             result = self.run_guard("transition", "--state", str(state), "--to", "implement")
             self.assertEqual(result.returncode, 2)
@@ -471,6 +654,8 @@ class GuardCliTests(unittest.TestCase):
             self.assertFalse(payload["replan_required"])
             self.assertEqual(payload["goal"], "revised hypothesis")
 
+            result = self.run_guard("record-plan", "--state", str(state))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             result = self.run_guard("transition", "--state", str(state), "--to", "implement")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -486,6 +671,7 @@ class GuardCliTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             target.write_text("value = 2\n", encoding="utf-8")
             commands = [
+                ("record-plan", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "implement"),
                 ("set-changes", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "verify"),
@@ -523,6 +709,7 @@ class GuardCliTests(unittest.TestCase):
             self.git(repo, "add", "--", "src/allowed.py")
 
             commands = [
+                ("record-plan", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "implement"),
                 ("set-changes", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "verify"),
@@ -561,6 +748,7 @@ class GuardCliTests(unittest.TestCase):
             allowed.write_text("after = True\n", encoding="utf-8")
             self.git(repo, "add", "--", "src/allowed.py")
             commands = [
+                ("record-plan", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "implement"),
                 ("set-changes", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "verify"),
@@ -594,12 +782,19 @@ class GuardCliTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             payload = json.loads(state.read_text(encoding="utf-8"))
-            payload["schema_version"] = 2
-            state.write_text(json.dumps(payload), encoding="utf-8")
             target.write_text("value = 2\n", encoding="utf-8")
             self.git(repo, "add", "--", "src/a.py")
             commands = [
+                ("record-plan", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "implement"),
+            ]
+            for command in commands:
+                result = self.run_guard(*command)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(state.read_text(encoding="utf-8"))
+            payload["schema_version"] = 2
+            state.write_text(json.dumps(payload), encoding="utf-8")
+            commands = [
                 ("set-changes", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "verify"),
                 ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "unit", "--command", "test", "--observed", "passed", "--level", "test", "--result", "pass"),
@@ -630,6 +825,7 @@ class GuardCliTests(unittest.TestCase):
             self.git(repo, "add", "--", "src/a.py")
             target.write_text("value = 2\n", encoding="utf-8")
             commands = [
+                ("record-plan", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "implement"),
                 ("set-changes", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "verify"),
@@ -676,6 +872,7 @@ class GuardCliTests(unittest.TestCase):
             self.git(repo, "add", "--", "src/a.py")
 
             commands = [
+                ("record-plan", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "implement"),
                 ("set-changes", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "verify"),
@@ -721,6 +918,8 @@ class GuardCliTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             allowed.write_text("task_change = True\n", encoding="utf-8")
+            result = self.run_guard("record-plan", "--state", str(state))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             result = self.run_guard("transition", "--state", str(state), "--to", "implement")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -765,6 +964,7 @@ class GuardCliTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             target.write_text("value = 2\n", encoding="utf-8")
             commands = [
+                ("record-plan", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "implement"),
                 ("set-changes", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "verify"),
@@ -818,6 +1018,8 @@ class GuardCliTests(unittest.TestCase):
                 "--goal", "detect moved baseline", "--write", "src/a.py", "--impact", "no_known_impact"
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            result = self.run_guard("record-plan", "--state", str(state))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             target.write_text("value = 2\n", encoding="utf-8")
             self.git(repo, "add", "--", "src/a.py")
             self.git(repo, "commit", "-m", "move head")
@@ -826,6 +1028,38 @@ class GuardCliTests(unittest.TestCase):
             result = self.run_guard("set-changes", "--state", str(state))
             self.assertEqual(result.returncode, 2)
             self.assertEqual(json.loads(result.stdout)["code"], "GIT_BASELINE_MOVED")
+
+    def test_write_plan_creates_markdown_and_refuses_to_replace_it(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            content = root / "initial-plan.md"
+            plan = root / "plan.md"
+            content.write_text("### MODE\n\n`FAST`\n", encoding="utf-8")
+
+            result = self.run_guard("write-plan", "--file", str(plan), "--content-file", str(content))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(plan.read_text(encoding="utf-8"), "### MODE\n\n`FAST`\n")
+
+            result = self.run_guard("write-plan", "--file", str(plan), "--content-file", str(content))
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "PLAN_FILE_EXISTS")
+
+    def test_prepend_requirement_places_new_markdown_above_existing_plan(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plan = root / "plan.md"
+            requirement = root / "requirement.md"
+            plan.write_text("### GOAL\n\nExisting Plan\n", encoding="utf-8")
+            requirement.write_text("## 新增需求\n\n保存 Plan 到 Markdown。\n", encoding="utf-8")
+
+            result = self.run_guard(
+                "prepend-requirement", "--file", str(plan), "--content-file", str(requirement)
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(
+                plan.read_text(encoding="utf-8"),
+                "## 新增需求\n\n保存 Plan 到 Markdown。\n\n---\n\n### GOAL\n\nExisting Plan\n",
+            )
 
 
 if __name__ == "__main__":

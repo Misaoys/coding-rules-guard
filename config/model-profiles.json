@@ -1,9 +1,10 @@
 {
-  "schema_version": 2,
+  "schema_version": 4,
   "delegation": {
+    "planner_profile": "session_main",
     "policy": "all_write_tasks",
     "executor_profile": "executor_default",
-    "reviewer_profile": "reviewer_default",
+    "reviewer_profile": "session_main",
     "review_required_for": "all_write_tasks",
     "read_only_policy": "no_delegation"
   },
@@ -12,14 +13,13 @@
       "model": "gpt-5.6-luna",
       "reasoning_effort": "max"
     },
-    "reviewer_default": {
-      "model": "gpt-5.6-sol",
-      "reasoning_effort": "xhigh"
+    "session_main": {
+      "source": "session_main"
     }
   },
   "fallback": {
-    "when": "configured profile is unavailable or unsupported",
-    "strategy": "use the best available configured fallback for the requested role and report the substitution",
+    "when": "a protected planner or executor profile is unavailable, or the current session main model cannot be recorded for review",
+    "strategy": "block the gate and require an explicit configuration repair or main-model record; never substitute a different role",
     "must_report": true
   }
 }

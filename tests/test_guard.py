@@ -770,6 +770,125 @@ class GuardCliTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("REVIEW_STALE", " ".join(json.loads(result.stdout)["details"]))
 
+    def test_inherited_index_paths_bind_only_when_unchanged_and_in_scope(self):
+        cases = (
+            ("staged-modification", "modify", "src", True),
+            ("staged-addition", "add", "src", True),
+            ("staged-deletion", "delete", "src", True),
+            ("content-drift", "content-drift", "src", False),
+            ("mode-drift", "mode-drift", "src", False),
+            ("out-of-scope", "modify", "src/task.py", False),
+            ("unstaged-then-committed", "unstaged", "src", False),
+        )
+        for name, inherited_setup, write_scope, should_complete in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    repo = root / "repo"
+                    repo.mkdir()
+                    self.git(repo, "init", "-b", "main")
+                    self.git(repo, "config", "user.name", "Test User")
+                    self.git(repo, "config", "user.email", "test@example.invalid")
+                    source = repo / "src"
+                    source.mkdir()
+                    inherited = source / "inherited.py"
+                    task = source / "task.py"
+                    inherited.write_text("inherited = 1\n", encoding="utf-8")
+                    task.write_text("task = 1\n", encoding="utf-8")
+                    initial_paths = ["src/task.py"]
+                    if inherited_setup != "add":
+                        initial_paths.insert(0, "src/inherited.py")
+                    self.git(repo, "add", "--", *initial_paths)
+                    self.git(repo, "commit", "-m", "initial")
+
+                    if inherited_setup in {"modify", "content-drift", "mode-drift"}:
+                        inherited.write_text("inherited = 2\n", encoding="utf-8")
+                        self.git(repo, "add", "--", "src/inherited.py")
+                    elif inherited_setup == "add":
+                        inherited.write_text("inherited = 2\n", encoding="utf-8")
+                        self.git(repo, "add", "--", "src/inherited.py")
+                    elif inherited_setup == "delete":
+                        inherited.unlink()
+                        self.git(repo, "add", "--", "src/inherited.py")
+                    elif inherited_setup == "unstaged":
+                        inherited.write_text("inherited = 2\n", encoding="utf-8")
+                    else:
+                        self.fail(f"unknown inherited setup: {inherited_setup}")
+
+                    state = root / "state.json"
+                    result = self.run_guard(
+                        "init", "--state", str(state), "--repo", str(repo), "--mode", "FULL",
+                        "--goal", "bind inherited staged paths", "--write", write_scope,
+                        "--impact", "no_known_impact", "--delivery-required"
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    initialized = json.loads(state.read_text(encoding="utf-8"))
+                    baseline_index = initialized["git_baseline"]["index_files"]
+                    inherited_rel = "src/inherited.py"
+                    if inherited_setup == "unstaged":
+                        self.assertNotIn(inherited_rel, baseline_index)
+                    else:
+                        self.assertIn(inherited_rel, baseline_index)
+                        self.assertEqual(
+                            guard.git_index_identity(repo, inherited_rel), baseline_index[inherited_rel]
+                        )
+
+                    task.write_text("task = 2\n", encoding="utf-8")
+                    self.git(repo, "add", "--", "src/task.py")
+                    commands = [
+                        ("record-plan", "--state", str(state)),
+                        ("transition", "--state", str(state), "--to", "implement"),
+                        ("set-changes", "--state", str(state)),
+                        ("transition", "--state", str(state), "--to", "verify"),
+                        ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "unit", "--command", "test", "--observed", "passed", "--level", "test", "--result", "pass"),
+                        ("record-evidence", "--state", str(state), "--kind", "boundary", "--entry", "edge", "--command", "test edge", "--observed", "passed", "--level", "test", "--result", "pass"),
+                        ("set-result", "--state", str(state), "--result", "pass"),
+                        ("record-review", "--state", str(state), "--result", "pass", "--observed", "reviewed task-only staged delta"),
+                        ("transition", "--state", str(state), "--to", "deliver"),
+                        ("audit", "--state", str(state), "--repo", str(repo)),
+                    ]
+                    for command in commands:
+                        result = self.run_guard(*command)
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+                    reviewed = json.loads(state.read_text(encoding="utf-8"))
+                    self.assertEqual(reviewed["changed_files"], ["src/task.py"])
+                    self.assertEqual(reviewed["delivery_audit"]["checked_files"], ["src/task.py"])
+                    self.assertEqual(
+                        reviewed["delivery_audit"]["task_fingerprint"], reviewed["review"]["task_fingerprint"]
+                    )
+
+                    if inherited_setup == "content-drift":
+                        inherited.write_text("inherited = 3\n", encoding="utf-8")
+                        self.git(repo, "add", "--", inherited_rel)
+                    elif inherited_setup == "mode-drift":
+                        self.git(repo, "update-index", "--chmod=+x", "--", inherited_rel)
+                    elif inherited_setup == "unstaged":
+                        self.git(repo, "add", "--", inherited_rel)
+                    self.git(repo, "commit", "-m", "deliver inherited and task changes")
+
+                    final_identity = guard.git_tree_identity(repo, "HEAD", inherited_rel)
+                    if inherited_setup in {"modify", "add", "delete"}:
+                        self.assertEqual(final_identity, baseline_index[inherited_rel])
+                    elif inherited_setup in {"content-drift", "mode-drift"}:
+                        self.assertNotEqual(final_identity, baseline_index[inherited_rel])
+                    else:
+                        self.assertNotIn(inherited_rel, baseline_index)
+
+                    post_commit_state = guard.load_state(state)
+                    committed_delta = guard.task_delta_files(post_commit_state)
+                    if should_complete:
+                        self.assertEqual(committed_delta, ["src/task.py"])
+                    else:
+                        self.assertEqual(committed_delta, ["src/inherited.py", "src/task.py"])
+
+                    result = self.run_guard("transition", "--state", str(state), "--to", "complete")
+                    if should_complete:
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    else:
+                        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                        self.assertIn("REVIEW_STALE", " ".join(json.loads(result.stdout)["details"]))
+
     def test_v2_delivery_audit_uses_the_real_review_fingerprint(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

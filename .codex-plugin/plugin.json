@@ -1,6 +1,6 @@
 {
   "name": "coding-rules-guard",
-  "version": "0.12.0+codex.20260905090704",
+  "version": "0.12.1+codex.20260905093218",
   "description": "Risk-routed workflow with strict minimal testing and current-session-main-model Plan and review gates.",
   "author": {
     "name": "Misaoys"

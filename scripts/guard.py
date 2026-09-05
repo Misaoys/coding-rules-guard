@@ -758,7 +758,6 @@ def task_delta_files(state: dict[str, Any]) -> list[str]:
     if not git_is_ancestor(repo, baseline["head"], current_head):
         raise GateError("GIT_BASELINE_MOVED", ["baseline HEAD is not an ancestor of current HEAD"])
 
-    committed = set(git_lines(repo, "diff", "--name-only", "--no-renames", baseline["head"], current_head))
     baseline_content = baseline.get("content_files")
     if not isinstance(baseline_content, dict):
         raise GateError("REVIEW_STATE_UPGRADE_REQUIRED", ["baseline content fingerprints are missing; rebuild with schema v4"])
@@ -767,7 +766,7 @@ def task_delta_files(state: dict[str, Any]) -> list[str]:
         if rel in baseline_content and filesystem_path_fingerprint(repo, rel) == baseline_content[rel]:
             continue
         residual.add(rel)
-    return sorted(committed | residual)
+    return sorted(set(committed_task_files(state, current_head)) | residual)
 
 
 def git_index_identity(repo: Path, rel: str) -> str:
@@ -809,6 +808,25 @@ def task_staged_files(state: dict[str, Any]) -> list[str]:
         if git_index_identity(repo, rel) != baseline_identity:
             changed.append(rel)
     return sorted(changed)
+
+
+def committed_task_files(state: dict[str, Any], current_head: str) -> list[str]:
+    repo = Path(state["repo"])
+    baseline = state["git_baseline"]
+    committed = set(git_lines(repo, "diff", "--name-only", "--no-renames", baseline["head"], current_head))
+    baseline_index = baseline["index_files"]
+    changed_files = set(state["changed_files"])
+    # Mirror the pre-commit baseline exemption without hiding modified or out-of-scope paths.
+    return sorted(
+        rel
+        for rel in committed
+        if not (
+            rel not in changed_files
+            and rel in baseline_index
+            and in_scope(rel, state["write_scope"])
+            and git_tree_identity(repo, current_head, rel) == baseline_index[rel]
+        )
+    )
 
 
 def fingerprint_identities(baseline_head: str, identities: list[tuple[str, str]]) -> str:
@@ -855,9 +873,7 @@ def compute_task_fingerprint(state: dict[str, Any]) -> str:
             )
         if not git_is_ancestor(repo, baseline_head, current_head):
             raise GateError("GIT_BASELINE_MOVED", ["baseline HEAD is not an ancestor of current HEAD"])
-        committed = sorted(
-            set(git_lines(repo, "diff", "--name-only", "--no-renames", baseline_head, current_head))
-        )
+        committed = committed_task_files(state, current_head)
         identities = [(rel, git_tree_identity(repo, current_head, rel)) for rel in committed]
         return fingerprint_identities(baseline_head, identities)
 

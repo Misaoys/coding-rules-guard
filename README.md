@@ -10,7 +10,10 @@ Coding Rules Guard is a Codex plugin for risk-routed coding work. It keeps low-r
 - Read-only work stays direct and session-audited; every task with `WRITE`, including FAST and small changes, uses the current session's main model for Plan and `executor_default` (`gpt-5.6-luna` + `max`) for implementation.
 - Every write task requires a review by the current session's main model before Complete or Deliver.
 - v4 machine-readable run state with a planner record, Plan fingerprint, write-scope checks, evidence records, and delivery audit.
+- A bounded `status` snapshot for handoff: it exposes phase, Plan revision, risk, gaps, and path counts without becoming a release gate; `CODING_GUARD_COMPACT=1` only removes JSON whitespace.
 - Git-baseline change detection that does not trust Agent-declared file lists.
+- Content-index Git fingerprints with NUL-safe path parsing, bounded argument batches, and an explicit legacy slow path marker.
+- Evidence fingerprints tied to the current task worktree, plus active `revise-plan --reason` support in Plan, Implement, and Verify.
 - Separate, audited gap authorization with machine-generated time and external actor identity.
 - A guarded `rework` loop that returns failed verification to implementation and invalidates stale evidence.
 - No default or repeated hash checks; hash parity runs once only when artifact identity is an acceptance criterion.
@@ -95,7 +98,7 @@ python scripts/guard.py record-plan `
 python scripts/guard.py transition --state .\work\run-state.json --to implement
 ```
 
-`record-plan` binds the session-main profile, model, reasoning effort, timestamp, Plan revision, the bound Plan Markdown path, and a fingerprint over `run_id`, repository, baseline HEAD, MODE, GOAL, WRITE, RISK, delivery flag, and revision. `plan → implement` rejects missing, expired, tampered, or drifted records, as well as missing current-session model information. After every complete gate passes, the CLI deletes the bound Plan Markdown; a blocked task keeps it. The record is an audit claim, not cryptographic proof of which model actually ran.
+`record-plan` binds the session-main profile, model, reasoning effort, timestamp, Plan revision, the bound Plan Markdown path and its UTF-8 bytes, and a fingerprint over `run_id`, repository, baseline HEAD, MODE, GOAL, WRITE, RISK, delivery flag, and revision. `plan → implement` rejects missing, expired, tampered, or drifted records, missing or changed Plan content, and missing current-session model information. After every complete gate passes, the CLI deletes the bound Plan Markdown; a blocked task keeps it. The record is an audit claim, not cryptographic proof of which model actually ran.
 
 After verification, the current session's main model is recorded with:
 
@@ -140,7 +143,7 @@ python scripts/guard.py init `
 python scripts/guard.py set-changes --state .\work\run-state.json
 ```
 
-`set-changes --file ...` is rejected for new v4 states. Pre-existing dirty files are fingerprinted at init: untouched files remain outside the task, while further task edits to them are detected. A changed Git HEAD must remain a descendant of the baseline and match the reviewed/audited delta.
+`set-changes --file ...` is rejected for new v4 states. Pre-existing dirty files are fingerprinted at init: untouched files remain outside the task, while further task edits to them are detected. Every Verify, evidence, review, audit, and Complete gate recomputes the real Git scope. During Plan/Implement/Verify, a changed HEAD stops the run; after a formally reviewed delivery, only the exact audited baseline-to-HEAD delta may complete.
 
 Legacy v2/v3 states can retain their historical review behavior after leaving Plan, but any v1-v3 state still in Plan fails closed with `PLAN_STATE_UPGRADE_REQUIRED`; create a v4 run-state before implementation. A revised Plan clears the old `plan_record`; run `revise-plan` and then `record-plan` again. Changing a Plan after recording it requires calling planner again rather than editing the card in the router.
 
@@ -170,8 +173,25 @@ python scripts/guard.py revise-plan `
   --goal "revised hypothesis" `
   --write src/target.py `
   --impact known_impact `
+  --reason "new evidence changed the hypothesis" `
   --risk-detail "hypothesis changed"
 ```
+
+`revise-plan --reason` is also available before the third failed rework, but only in `plan`, `implement`, or `verify`; it clears stale evidence/review/authorization state, increments the Plan revision, and checks current Git paths before accepting the new scope. If `--delivery-required` or `--no-delivery-required` is omitted, the existing delivery intent is preserved rather than silently cancelled. A forced third-rework revision may reuse its recorded failure reason when the option is omitted.
+
+## State snapshots and upgrades
+
+Use `status` for a compact handoff summary, not for authorization:
+
+```powershell
+python scripts/guard.py status --state .\work\run-state.json --limit 20
+$env:CODING_GUARD_COMPACT = '1'
+python scripts/guard.py status --state .\work\run-state.json --limit 20
+```
+
+`--limit` accepts 1–200 and only bounds displayed path samples. The response keeps `snapshot: state_only_not_a_gate`, full risk and gaps, path totals, truncation flags, and `review_recorded` (which means a record exists, not that it is still valid). Invalid limits and unreadable state fail without changing the state.
+
+New run states use `schema_version: 4` and `git_baseline.fingerprint_format: content-index-v1`. A missing format marker uses the explicit compatibility slow path; an unknown marker blocks. Evidence from an older v4 state without `worktree_fingerprint` must be re-recorded through a real verification path. Finish or pause a run before upgrading, keep the old state for audit, and create a new state with the new CLI; never pass a new state to an old CLI or reuse an old state as if it had new bindings. Plan and state files must stay outside the business repository, and `init` never overwrites an existing state.
 
 ## Evidence boundary
 

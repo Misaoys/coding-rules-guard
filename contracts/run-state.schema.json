@@ -45,14 +45,15 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["kind", "entry", "command", "observed", "level", "result"],
+        "required": ["kind", "entry", "command", "observed", "level", "result", "worktree_fingerprint"],
         "properties": {
           "kind": { "enum": ["success", "boundary"] },
           "entry": { "type": "string", "minLength": 1 },
           "command": { "type": "string", "minLength": 1 },
           "observed": { "type": "string", "minLength": 1 },
           "level": { "enum": ["source", "test", "browser", "installed", "host", "production"] },
-          "result": { "enum": ["pass", "fail", "blocked"] }
+          "result": { "enum": ["pass", "fail", "blocked"] },
+          "worktree_fingerprint": { "type": "string", "minLength": 1 }
         },
         "additionalProperties": false
       }
@@ -83,6 +84,7 @@
     },
     "rework_count": { "type": "integer", "minimum": 0 },
     "last_rework_reason": { "type": ["string", "null"] },
+    "last_replan_reason": { "type": ["string", "null"] },
     "rework_streak": { "type": "integer", "minimum": 0 },
     "replan_required": { "type": "boolean" },
     "plan_revision": { "type": "integer", "minimum": 1 },
@@ -103,7 +105,8 @@
         "index_files": {
           "type": "object",
           "additionalProperties": { "type": "string", "minLength": 1 }
-        }
+        },
+        "fingerprint_format": { "type": "string", "minLength": 1 }
       },
       "required": ["head", "files", "content_files", "index_files"],
       "additionalProperties": false

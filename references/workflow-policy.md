@@ -44,6 +44,9 @@
 - 新运行必须在 `guard.py init --repo <仓库>` 记录 Git HEAD 和已有脏文件指纹。v4 状态还必须记录 planner profile；Plan 完成后使用 `guard.py record-plan` 写入 planner/model/reasoning、Plan revision 和绑定 `run_id`、repo、baseline HEAD、MODE、GOAL、WRITE、RISK、delivery flag 的 fingerprint。`plan → implement` 会重新校验配置、记录、revision 和 fingerprint；无记录、过期、篡改或配置漂移均阻断。`set-changes` 不接收 Agent 声明的文件列表，而是自动计算相对 baseline 的任务差异；未被任务触碰的既有脏文件不计入本任务，任务继续修改既有脏文件则会被识别。
 - baseline 后 Git HEAD 改变时停止并要求新建状态，避免跨提交或切分支掩盖改动。
 - `set-result pass_with_gaps` 只提出缺口，不授权。只有独立的 `authorize-gaps` 能写入机器时间、授权者和原因；Agent 不得把自己声明为用户或宿主。缺少授权记录不能 Complete 或 Deliver。
+- 新基线使用 `git_baseline.fingerprint_format = "content-index-v1"`；缺少标记的旧基线只走明确的兼容慢路径，未知标记直接阻断。Plan 正文、证据工作区身份和实际任务路径都必须在相应放行点重新核对。
+- `status --limit` 只输出状态摘要，返回 `snapshot: state_only_not_a_gate`；它不改变状态、不代替 Git 检查，截断只影响展示，不影响真实 WRITE 范围。`CODING_GUARD_COMPACT=1` 只压缩 JSON 空白，不删字段。
+- `revise-plan --reason` 可在 `plan`、`implement`、`verify` 主动触发重规划；原因必须持久保存，新的完整 MODE/GOAL/WRITE/RISK 和交付意图不能遗漏实时已发生改动。强制三次返工仍保持原有 `REPLAN_REQUIRED` 门禁。
 
 ## 阶段
 

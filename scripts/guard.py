@@ -7,9 +7,11 @@ import argparse
 import fnmatch
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -23,6 +25,9 @@ LEVELS = {"source", "test", "browser", "installed", "host", "production"}
 REVIEW_RESULTS = {"pass", "fail", "blocked"}
 CURRENT_SCHEMA_VERSION = 4
 SUPPORTED_SCHEMA_VERSIONS = {1, 2, 3, CURRENT_SCHEMA_VERSION}
+BASELINE_FINGERPRINT_FORMAT = "content-index-v1"
+GIT_BATCH_MAX_PATHS = 128
+GIT_BATCH_MAX_BYTES = 8192
 REWORK_WARN_AT = 2
 REWORK_REPLAN_AT = 3
 PLAN_RECORD_MAX_AGE = timedelta(hours=24)
@@ -42,7 +47,10 @@ class GateError(Exception):
 
 
 def emit(payload: dict[str, Any], exit_code: int = 0) -> None:
-    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    if os.environ.get("CODING_GUARD_COMPACT") == "1":
+        print(json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True))
+    else:
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     raise SystemExit(exit_code)
 
 
@@ -51,6 +59,38 @@ def normalize_path(value: str) -> str:
     while normalized.startswith("./"):
         normalized = normalized[2:]
     return normalized.rstrip("/")
+
+
+def normalize_git_path(value: str) -> str:
+    """Preserve Git path text; do not trim or interpret it as a scope glob."""
+    return value
+
+
+def path_exists_including_broken_symlink(path: Path) -> bool:
+    return os.path.lexists(os.fspath(path))
+
+
+def path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+    except ValueError:
+        return False
+    return True
+
+
+def ensure_external_artifact(path: Path, repo: Path, label: str) -> Path:
+    """Require an artifact to be outside the repository by literal and resolved paths."""
+    absolute = path.absolute()
+    resolved = absolute.resolve(strict=False)
+    repo_resolved = repo.resolve(strict=False)
+    if path_is_within(absolute, repo) or path_is_within(resolved, repo_resolved):
+        raise GateError(f"{label.upper()}_IN_REPOSITORY", [str(path), str(repo)])
+    return absolute
+
+
+def ensure_not_symlink(path: Path, label: str) -> None:
+    if path.is_symlink():
+        raise GateError(f"{label.upper()}_SYMLINK_FORBIDDEN", [str(path)])
 
 
 def load_state(path: Path) -> dict[str, Any]:
@@ -66,7 +106,32 @@ def load_state(path: Path) -> dict[str, Any]:
 
 def save_state(path: Path, state: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if path.is_symlink():
+        raise GateError("STATE_PATH_SYMLINK_FORBIDDEN", [str(path)])
+    content = (json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as handle:
+            temporary_name = handle.name
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        Path(temporary_name).replace(path)
+        temporary_name = None
+    except OSError as exc:
+        raise GateError("STATE_SAVE_FAILED", [str(exc)]) from exc
+    finally:
+        if temporary_name is not None:
+            try:
+                Path(temporary_name).unlink()
+            except OSError:
+                pass
 
 
 def read_markdown_content(args: argparse.Namespace) -> str:
@@ -88,6 +153,7 @@ def read_markdown_content(args: argparse.Namespace) -> str:
 
 def replace_markdown_file(path: Path, content: str) -> None:
     """Atomically replace an existing plan document without leaving a partial file."""
+    ensure_not_symlink(path, "plan_file")
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         temporary.write_text(content, encoding="utf-8")
@@ -112,6 +178,7 @@ def command_write_plan(args: argparse.Namespace) -> None:
 
 def command_prepend_requirement(args: argparse.Namespace) -> None:
     content = read_markdown_content(args)
+    ensure_not_symlink(args.file, "plan_file")
     try:
         existing = args.file.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
@@ -221,6 +288,20 @@ def compute_plan_fingerprint(state: dict[str, Any]) -> str:
     }
     if "plan_file" in state:
         payload["plan_file"] = state.get("plan_file")
+        if state.get("plan_file") is not None:
+            plan_path = Path(state["plan_file"])
+            repo_path = Path(state["repo"])
+            ensure_external_artifact(plan_path, repo_path, "plan_file")
+            ensure_not_symlink(plan_path, "plan_file")
+            try:
+                plan_bytes = plan_path.read_bytes()
+            except FileNotFoundError as exc:
+                raise GateError("PLAN_FILE_MISSING", [str(plan_path)]) from exc
+            except OSError as exc:
+                raise GateError("PLAN_FILE_UNREADABLE", [str(exc)]) from exc
+            if not plan_path.is_file():
+                raise GateError("PLAN_FILE_INVALID", [f"Plan path is not a file: {plan_path}"])
+            payload["plan_content_sha256"] = hashlib.sha256(plan_bytes).hexdigest()
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -407,6 +488,9 @@ def validate_shape(state: dict[str, Any]) -> None:
     rework_reason = state.get("last_rework_reason")
     if rework_reason is not None and (not isinstance(rework_reason, str) or not rework_reason.strip()):
         errors.append("last_rework_reason must be null or a non-empty string")
+    replan_reason = state.get("last_replan_reason")
+    if replan_reason is not None and (not isinstance(replan_reason, str) or not replan_reason.strip()):
+        errors.append("last_replan_reason must be null or a non-empty string")
     rework_streak = state.get("rework_streak", 0)
     if not isinstance(rework_streak, int) or isinstance(rework_streak, bool) or rework_streak < 0:
         errors.append("rework_streak must be a non-negative integer")
@@ -432,6 +516,9 @@ def validate_shape(state: dict[str, Any]) -> None:
             errors.append("git_baseline.content_files must be an object")
         elif schema_version in {3, 4} and not isinstance(baseline.get("index_files"), dict):
             errors.append("git_baseline.index_files must be an object")
+        fingerprint_format = baseline.get("fingerprint_format")
+        if fingerprint_format is not None and (not isinstance(fingerprint_format, str) or not fingerprint_format.strip()):
+            errors.append("git_baseline.fingerprint_format must be null or a non-empty string")
         if state.get("change_detection") != "git_baseline":
             errors.append("change_detection must be git_baseline")
         authorization = state.get("gap_authorization")
@@ -546,6 +633,10 @@ def validate_shape(state: dict[str, Any]) -> None:
             if not isinstance(item, dict) or not required.issubset(item):
                 errors.append(f"evidence[{index}] is incomplete")
                 continue
+            if schema_version == CURRENT_SCHEMA_VERSION and (
+                not isinstance(item.get("worktree_fingerprint"), str) or not item["worktree_fingerprint"].strip()
+            ):
+                errors.append(f"evidence[{index}] is missing worktree_fingerprint")
             if item["kind"] not in {"success", "boundary"} or item["level"] not in LEVELS:
                 errors.append(f"evidence[{index}] has an invalid kind or level")
             if item["result"] not in {"pass", "fail", "blocked"}:
@@ -557,15 +648,17 @@ def validate_shape(state: dict[str, Any]) -> None:
 
 
 def in_scope(path: str, scopes: Iterable[str]) -> bool:
-    candidate = normalize_path(path)
+    candidate = normalize_git_path(path)
     for raw_scope in scopes:
         scope = normalize_path(raw_scope)
         if not scope:
             continue
-        if any(mark in scope for mark in "*?["):
-            if fnmatch.fnmatchcase(candidate, scope) or PurePosixPath(candidate).match(scope):
-                return True
-        elif candidate == scope or candidate.startswith(scope + "/"):
+        # First honor exact/directory paths so literal '*' and '[' filenames are
+        # never reinterpreted as glob syntax.
+        if candidate == scope or candidate.startswith(scope + "/"):
+            return True
+        has_glob = "*" in scope or "?" in scope or ("[" in scope and "]" in scope)
+        if has_glob and fnmatch.fnmatchcase(candidate, scope):
             return True
     return False
 
@@ -585,6 +678,20 @@ def ensure_evidence(state: dict[str, Any]) -> list[str]:
         errors.append("pass cannot contain gaps; use pass_with_gaps")
     if state["result"] == "pass_with_gaps" and not any(item.get("result") == "blocked" for item in evidence):
         errors.append("pass_with_gaps requires a blocked evidence boundary")
+    if state.get("schema_version") in {2, 3, 4} and evidence:
+        fingerprints = {item.get("worktree_fingerprint") for item in evidence}
+        if None in fingerprints or "" in fingerprints:
+            errors.append("EVIDENCE_STATE_UPGRADE_REQUIRED: evidence lacks worktree_fingerprint")
+        else:
+            try:
+                current_fingerprint = compute_evidence_fingerprint(state)
+            except GateError as exc:
+                errors.extend(f"EVIDENCE_STALE: {exc.code}: {detail}" for detail in exc.details)
+            else:
+                for item in evidence:
+                    if item.get("worktree_fingerprint") != current_fingerprint:
+                        errors.append("EVIDENCE_STALE: evidence no longer matches the current worktree")
+                        break
     return errors
 
 
@@ -616,7 +723,17 @@ def check_transition(state: dict[str, Any], target: str) -> None:
         outside = [path for path in state["changed_files"] if not in_scope(path, state["write_scope"])]
         if outside:
             errors.append("out-of-scope changes: " + ", ".join(outside))
+        if state.get("schema_version") in {2, 3, 4}:
+            try:
+                ensure_current_scope(state)
+            except GateError as exc:
+                errors.extend(f"{exc.code}: {detail}" for detail in exc.details)
     elif target in {"deliver", "complete"}:
+        if state.get("schema_version") in {2, 3, 4}:
+            try:
+                ensure_current_scope(state)
+            except GateError as exc:
+                errors.extend(f"{exc.code}: {detail}" for detail in exc.details)
         errors.extend(ensure_evidence(state))
         errors.extend(ensure_review(state))
         if state["result"] not in {"pass", "pass_with_gaps"}:
@@ -644,7 +761,7 @@ def git_lines(repo: Path, *args: str) -> list[str]:
     )
     if result.returncode != 0:
         raise GateError("GIT_COMMAND_FAILED", [result.stderr.strip() or "git command failed"])
-    return [normalize_path(line) for line in result.stdout.splitlines() if line.strip()]
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
 def git_bytes(repo: Path, *args: str) -> bytes:
@@ -655,9 +772,109 @@ def git_bytes(repo: Path, *args: str) -> bytes:
     return result.stdout
 
 
+def decode_git_path(value: bytes) -> str:
+    return value.decode("utf-8", errors="surrogateescape")
+
+
+def git_paths(repo: Path, *args: str) -> list[str]:
+    """Read NUL-delimited Git paths without line or whitespace normalization."""
+    output = git_bytes(repo, *args)
+    return [normalize_git_path(decode_git_path(item)) for item in output.split(b"\0") if item]
+
+
+def literal_pathspec(rel: str) -> str:
+    return f":(literal){rel}"
+
+
+def path_batches(paths: Iterable[str]) -> Iterable[list[str]]:
+    batch: list[str] = []
+    size = 0
+    for rel in sorted(set(paths)):
+        encoded_size = len(literal_pathspec(rel).encode("utf-8", errors="surrogatepass")) + 1
+        if encoded_size > GIT_BATCH_MAX_BYTES:
+            raise GateError("GIT_PATH_TOO_LONG", [rel, str(GIT_BATCH_MAX_BYTES)])
+        if batch and (len(batch) >= GIT_BATCH_MAX_PATHS or size + encoded_size > GIT_BATCH_MAX_BYTES):
+            yield batch
+            batch = []
+            size = 0
+        batch.append(rel)
+        size += encoded_size
+    if batch:
+        yield batch
+
+
+def git_index_identities(repo: Path, paths: Iterable[str]) -> dict[str, str]:
+    requested = sorted(set(paths))
+    identities: dict[str, list[str]] = {rel: [] for rel in requested}
+    for batch in path_batches(requested):
+        output = git_bytes(
+            repo,
+            "ls-files",
+            "-s",
+            "-z",
+            "--",
+            *(literal_pathspec(rel) for rel in batch),
+        )
+        for record in output.split(b"\0"):
+            if not record:
+                continue
+            try:
+                header, raw_path = record.split(b"\t", 1)
+            except ValueError as exc:
+                raise GateError("GIT_INDEX_INVALID", [decode_git_path(record)]) from exc
+            fields = header.split()
+            if len(fields) < 3:
+                raise GateError("GIT_INDEX_INVALID", [decode_git_path(record)])
+            rel = decode_git_path(raw_path)
+            mode = fields[0].decode()
+            object_id = fields[1].decode()
+            stage = fields[2].decode()
+            identities.setdefault(rel, []).append(
+                f"{mode}:{object_id}" if stage == "0" else f"{mode}:{object_id}:{stage}"
+            )
+    return {rel: "|".join(sorted(values)) if values else "missing" for rel, values in identities.items()}
+
+
+def git_tree_identities(repo: Path, treeish: str, paths: Iterable[str]) -> dict[str, str]:
+    requested = sorted(set(paths))
+    identities: dict[str, list[str]] = {rel: [] for rel in requested}
+    for batch in path_batches(requested):
+        output = git_bytes(
+            repo,
+            "ls-tree",
+            "-z",
+            treeish,
+            "--",
+            *(literal_pathspec(rel) for rel in batch),
+        )
+        for record in output.split(b"\0"):
+            if not record:
+                continue
+            try:
+                header, raw_path = record.split(b"\t", 1)
+            except ValueError as exc:
+                raise GateError("GIT_TREE_INVALID", [decode_git_path(record)]) from exc
+            fields = header.split()
+            if len(fields) < 3:
+                raise GateError("GIT_TREE_INVALID", [decode_git_path(record)])
+            rel = decode_git_path(raw_path)
+            identities.setdefault(rel, []).append(f"{fields[0].decode()}:{fields[2].decode()}")
+    return {rel: "|".join(sorted(values)) if values else "missing" for rel, values in identities.items()}
+
+
+def git_state_fingerprints(repo: Path, treeish: str, paths: Iterable[str]) -> dict[str, str]:
+    requested = sorted(set(paths))
+    index = git_index_identities(repo, requested)
+    tree = git_tree_identities(repo, treeish, requested)
+    return {
+        rel: path_state_fingerprint(repo, rel, index.get(rel, "missing"), tree.get(rel, "missing"))
+        for rel in requested
+    }
+
+
 def actual_git_files(repo: Path) -> list[str]:
-    files = set(git_lines(repo, "diff", "--name-only", "--no-renames", "HEAD"))
-    files.update(git_lines(repo, "ls-files", "--others", "--exclude-standard"))
+    files = set(git_paths(repo, "diff", "--name-only", "--no-renames", "-z", "HEAD"))
+    files.update(git_paths(repo, "ls-files", "--others", "--exclude-standard", "-z"))
     return sorted(files)
 
 
@@ -688,13 +905,28 @@ def filesystem_path_fingerprint(repo: Path, rel: str) -> str:
     return digest.hexdigest()
 
 
+def path_state_fingerprint(repo: Path, rel: str, index_identity: str, tree_identity: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"content-index-v1\0path\0")
+    digest.update(rel.encode("utf-8", errors="surrogatepass"))
+    digest.update(b"\0worktree\0")
+    digest.update(filesystem_path_fingerprint(repo, rel).encode("ascii"))
+    digest.update(b"\0index\0")
+    digest.update(index_identity.encode("utf-8"))
+    digest.update(b"\0tree\0")
+    digest.update(tree_identity.encode("utf-8"))
+    return digest.hexdigest()
+
+
 def git_path_fingerprint(repo: Path, rel: str) -> str:
     digest = hashlib.sha256()
     digest.update(filesystem_path_fingerprint(repo, rel).encode("ascii"))
     digest.update(b"\0combined-diff\0")
-    digest.update(git_bytes(repo, "diff", "--binary", "--no-renames", "HEAD", "--", rel))
+    digest.update(git_bytes(repo, "diff", "--binary", "--no-renames", "HEAD", "--", literal_pathspec(rel)))
     digest.update(b"\0index-diff\0")
-    digest.update(git_bytes(repo, "diff", "--cached", "--binary", "--no-renames", "HEAD", "--", rel))
+    digest.update(
+        git_bytes(repo, "diff", "--cached", "--binary", "--no-renames", "HEAD", "--", literal_pathspec(rel))
+    )
     return digest.hexdigest()
 
 
@@ -703,13 +935,22 @@ def capture_git_baseline(repo: Path) -> dict[str, Any]:
     if not head:
         raise GateError("GIT_HEAD_REQUIRED", [str(repo)])
     dirty = actual_git_files(repo)
-    staged = set(git_lines(repo, "diff", "--cached", "--name-only", "--no-renames", "HEAD"))
+    staged = set(git_paths(repo, "diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD"))
+    state_fingerprints = git_state_fingerprints(repo, head[0], dirty)
+    index_identities = git_index_identities(repo, staged)
     return {
         "head": head[0],
-        "files": {path: git_path_fingerprint(repo, path) for path in dirty},
+        "fingerprint_format": BASELINE_FINGERPRINT_FORMAT,
+        "files": state_fingerprints,
         "content_files": {path: filesystem_path_fingerprint(repo, path) for path in dirty},
-        "index_files": {path: git_index_identity(repo, path) for path in staged},
+        "index_files": index_identities,
     }
+
+
+def ensure_baseline_fingerprint_format(state: dict[str, Any]) -> None:
+    fingerprint_format = state["git_baseline"].get("fingerprint_format")
+    if fingerprint_format is not None and fingerprint_format != BASELINE_FINGERPRINT_FORMAT:
+        raise GateError("GIT_BASELINE_FORMAT_UNKNOWN", [str(fingerprint_format)])
 
 
 def task_git_files(state: dict[str, Any]) -> list[str]:
@@ -719,12 +960,21 @@ def task_git_files(state: dict[str, Any]) -> list[str]:
     if not current_head or current_head[0] != baseline["head"]:
         raise GateError("GIT_BASELINE_MOVED", ["Git HEAD changed after init; start a new run state"])
     current = set(actual_git_files(repo))
-    candidates = current | set(baseline["files"])
-    changed = [
-        path
-        for path in candidates
-        if git_path_fingerprint(repo, path) != baseline["files"].get(path)
-    ]
+    candidates = sorted(current | set(baseline["files"]))
+    fingerprint_format = baseline.get("fingerprint_format")
+    if fingerprint_format is None:
+        # Old v2/v3/v4 baselines remain readable through an explicit slow path;
+        # never interpret their old digest as the new content-index format.
+        changed = [
+            path
+            for path in candidates
+            if git_path_fingerprint(repo, path) != baseline["files"].get(path)
+        ]
+        return sorted(changed)
+    if fingerprint_format != BASELINE_FINGERPRINT_FORMAT:
+        raise GateError("GIT_BASELINE_FORMAT_UNKNOWN", [str(fingerprint_format)])
+    current_fingerprints = git_state_fingerprints(repo, baseline["head"], candidates)
+    changed = [path for path in candidates if current_fingerprints[path] != baseline["files"].get(path)]
     return sorted(changed)
 
 
@@ -744,6 +994,7 @@ def task_delta_files(state: dict[str, Any]) -> list[str]:
         raise GateError("REVIEW_STATE_UPGRADE_REQUIRED", ["v1 state has no Git baseline for review binding"])
     repo = Path(state["repo"])
     baseline = state["git_baseline"]
+    ensure_baseline_fingerprint_format(state)
     current_head_lines = git_lines(repo, "rev-parse", "HEAD")
     if not current_head_lines:
         raise GateError("GIT_HEAD_REQUIRED", [str(repo)])
@@ -770,42 +1021,33 @@ def task_delta_files(state: dict[str, Any]) -> list[str]:
 
 
 def git_index_identity(repo: Path, rel: str) -> str:
-    lines = git_lines(repo, "ls-files", "-s", "--", rel)
-    if not lines:
-        return "missing"
-    fields = lines[0].split()
-    if len(fields) < 2:
-        raise GateError("GIT_INDEX_INVALID", [rel, lines[0]])
-    return f"{fields[0]}:{fields[1]}"
+    return git_index_identities(repo, [rel]).get(rel, "missing")
 
 
 def git_tree_identity(repo: Path, treeish: str, rel: str) -> str:
-    lines = git_lines(repo, "ls-tree", treeish, "--", rel)
-    if not lines:
-        return "missing"
-    fields = lines[0].split()
-    if len(fields) < 3:
-        raise GateError("GIT_TREE_INVALID", [rel, lines[0]])
-    return f"{fields[0]}:{fields[2]}"
+    return git_tree_identities(repo, treeish, [rel]).get(rel, "missing")
 
 
 def task_staged_files(state: dict[str, Any]) -> list[str]:
     repo = Path(state["repo"])
     baseline = state["git_baseline"]
+    ensure_baseline_fingerprint_format(state)
     current_head = git_lines(repo, "rev-parse", "HEAD")
     if not current_head or current_head[0] != baseline["head"]:
         raise GateError("GIT_BASELINE_MOVED", ["staged review requires the baseline HEAD"])
     baseline_index = baseline.get("index_files", {})
-    current_staged = set(git_lines(repo, "diff", "--cached", "--name-only", "--no-renames", "HEAD"))
+    current_staged = set(git_paths(repo, "diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD"))
     candidates = current_staged | set(baseline_index)
+    current_index = git_index_identities(repo, candidates)
+    baseline_tree = git_tree_identities(repo, baseline["head"], candidates)
     changed: list[str] = []
     for rel in candidates:
         baseline_identity = (
             baseline_index[rel]
             if rel in baseline_index
-            else git_tree_identity(repo, baseline["head"], rel)
+            else baseline_tree.get(rel, "missing")
         )
-        if git_index_identity(repo, rel) != baseline_identity:
+        if current_index.get(rel, "missing") != baseline_identity:
             changed.append(rel)
     return sorted(changed)
 
@@ -813,9 +1055,11 @@ def task_staged_files(state: dict[str, Any]) -> list[str]:
 def committed_task_files(state: dict[str, Any], current_head: str) -> list[str]:
     repo = Path(state["repo"])
     baseline = state["git_baseline"]
-    committed = set(git_lines(repo, "diff", "--name-only", "--no-renames", baseline["head"], current_head))
+    ensure_baseline_fingerprint_format(state)
+    committed = set(git_paths(repo, "diff", "--name-only", "--no-renames", "-z", baseline["head"], current_head))
     baseline_index = baseline["index_files"]
     changed_files = set(state["changed_files"])
+    tree_identities = git_tree_identities(repo, current_head, committed)
     # Mirror the pre-commit baseline exemption without hiding modified or out-of-scope paths.
     return sorted(
         rel
@@ -824,7 +1068,7 @@ def committed_task_files(state: dict[str, Any], current_head: str) -> list[str]:
             rel not in changed_files
             and rel in baseline_index
             and in_scope(rel, state["write_scope"])
-            and git_tree_identity(repo, current_head, rel) == baseline_index[rel]
+            and tree_identities.get(rel, "missing") == baseline_index[rel]
         )
     )
 
@@ -859,11 +1103,12 @@ def compute_task_fingerprint(state: dict[str, Any]) -> str:
                     "REVIEW_STAGE_MISMATCH",
                     [f"staged task paths {staged!r} do not match detected task paths {expected!r}"],
                 )
-            unstaged = set(git_lines(repo, "diff", "--name-only", "--no-renames"))
+            unstaged = set(git_paths(repo, "diff", "--name-only", "--no-renames", "-z"))
             split = sorted(unstaged & set(expected))
             if split:
                 raise GateError("REVIEW_STAGE_MISMATCH", ["index/worktree split: " + ", ".join(split)])
-            identities = [(rel, git_index_identity(repo, rel)) for rel in staged]
+            identities_map = git_index_identities(repo, staged)
+            identities = [(rel, identities_map.get(rel, "missing")) for rel in staged]
             return fingerprint_identities(baseline_head, identities)
 
         if state.get("schema_version") == 2:
@@ -874,7 +1119,8 @@ def compute_task_fingerprint(state: dict[str, Any]) -> str:
         if not git_is_ancestor(repo, baseline_head, current_head):
             raise GateError("GIT_BASELINE_MOVED", ["baseline HEAD is not an ancestor of current HEAD"])
         committed = committed_task_files(state, current_head)
-        identities = [(rel, git_tree_identity(repo, current_head, rel)) for rel in committed]
+        tree_identities = git_tree_identities(repo, current_head, committed)
+        identities = [(rel, tree_identities.get(rel, "missing")) for rel in committed]
         return fingerprint_identities(baseline_head, identities)
 
     staged = task_staged_files(state)
@@ -884,6 +1130,58 @@ def compute_task_fingerprint(state: dict[str, Any]) -> str:
             ["staged task paths are not part of the reviewed worktree: " + ", ".join(staged)],
         )
     identities = [(rel, filesystem_path_fingerprint(repo, rel)) for rel in task_delta_files(state)]
+    return fingerprint_identities(baseline_head, identities)
+
+
+def current_task_paths(state: dict[str, Any]) -> list[str]:
+    if state.get("schema_version") not in {2, 3, 4}:
+        return list(state.get("changed_files", []))
+    repo = Path(state["repo"])
+    current_head = git_lines(repo, "rev-parse", "HEAD")
+    if not current_head:
+        raise GateError("GIT_HEAD_REQUIRED", [str(repo)])
+    if current_head[0] == state["git_baseline"]["head"]:
+        return task_git_files(state)
+    return task_delta_files(state)
+
+
+def ensure_current_scope(state: dict[str, Any], *, require_registered: bool = True) -> list[str]:
+    """Recompute task paths at every release point instead of trusting old state."""
+    actual = current_task_paths(state)
+    outside = [path for path in actual if not in_scope(path, state["write_scope"])]
+    if outside:
+        raise GateError("OUT_OF_SCOPE_CHANGE", ["out-of-scope git changes: " + ", ".join(outside)])
+    if require_registered:
+        registered = sorted(set(state.get("changed_files", [])))
+        if sorted(actual) != registered:
+            missing = sorted(set(actual) - set(registered))
+            stale = sorted(set(registered) - set(actual))
+            details = [
+                f"registered task paths {registered!r} do not match current Git paths {sorted(actual)!r}"
+            ]
+            if missing:
+                details.append("unregistered git changes: " + ", ".join(missing))
+            if stale:
+                details.append("registered paths no longer changed: " + ", ".join(stale))
+            raise GateError("CHANGES_NOT_REGISTERED", details)
+    return actual
+
+
+def compute_evidence_fingerprint(state: dict[str, Any]) -> str:
+    """Bind evidence to worktree bytes/mode/link targets and deletion identities."""
+    if state.get("schema_version") not in {2, 3, 4}:
+        raise GateError("EVIDENCE_STATE_UPGRADE_REQUIRED", ["evidence binding requires a Git baseline"])
+    actual = ensure_current_scope(state)
+    repo = Path(state["repo"])
+    baseline_head = state["git_baseline"]["head"]
+    tree_identities = git_tree_identities(repo, baseline_head, actual)
+    identities = [
+        (
+            rel,
+            "worktree=" + filesystem_path_fingerprint(repo, rel) + ";baseline=" + tree_identities.get(rel, "missing"),
+        )
+        for rel in actual
+    ]
     return fingerprint_identities(baseline_head, identities)
 
 
@@ -906,8 +1204,59 @@ def secret_findings(repo: Path, files: Iterable[str]) -> list[str]:
     return findings
 
 
+def status_limit(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("limit must be an integer from 1 to 200") from exc
+    if not 1 <= parsed <= 200:
+        raise argparse.ArgumentTypeError("limit must be an integer from 1 to 200")
+    return parsed
+
+
+def bounded_paths(values: Iterable[str], limit: int) -> dict[str, Any]:
+    paths = list(values)
+    return {
+        "items": paths[:limit],
+        "total": len(paths),
+        "truncated": len(paths) > limit,
+    }
+
+
+def command_status(args: argparse.Namespace) -> None:
+    state = load_state(args.state)
+    emit(
+        {
+            "ok": True,
+            "snapshot": "state_only_not_a_gate",
+            "state": str(args.state),
+            "phase": state["phase"],
+            "mode": state["mode"],
+            "goal": state["goal"],
+            "plan": {
+                "file": state.get("plan_file"),
+                "revision": state.get("plan_revision", 1),
+            },
+            "risk": state["risk"],
+            "result": state["result"],
+            "gaps": list(state.get("gaps", [])),
+            "needs_replan": bool(state.get("replan_required", False)),
+            "needs_delivery": bool(state.get("delivery_required", False) and state["phase"] != "complete"),
+            "review_recorded": isinstance(state.get("review"), dict),
+            "paths": {
+                "write_scope": bounded_paths(state.get("write_scope", []), args.limit),
+                "changed_files": bounded_paths(state.get("changed_files", []), args.limit),
+            },
+        }
+    )
+
+
 def command_init(args: argparse.Namespace) -> None:
     repo = git_repo_root(args.repo)
+    state_path = args.state.absolute()
+    if path_exists_including_broken_symlink(state_path):
+        raise GateError("STATE_FILE_EXISTS", [str(state_path), "init never overwrites an existing state"])
+    ensure_external_artifact(state_path, repo, "state_file")
     git_baseline = capture_git_baseline(repo)
     config = load_model_config()
     planner_name, _ = configured_role(config, "planner")
@@ -917,9 +1266,12 @@ def command_init(args: argparse.Namespace) -> None:
     review_required = bool(write_scope)
     plan_file = None
     if args.plan_file is not None:
-        plan_path = args.plan_file.absolute()
+        plan_path = ensure_external_artifact(args.plan_file, repo, "plan_file")
+        ensure_not_symlink(plan_path, "plan_file")
         if not plan_path.is_file():
             raise GateError("PLAN_FILE_NOT_FOUND", [str(plan_path), "write the Plan before init"])
+        if plan_path.resolve(strict=False) == state_path.resolve(strict=False):
+            raise GateError("PLAN_STATE_PATH_CONFLICT", [str(plan_path), str(state_path)])
         plan_file = str(plan_path)
     state = {
         "schema_version": CURRENT_SCHEMA_VERSION,
@@ -941,6 +1293,7 @@ def command_init(args: argparse.Namespace) -> None:
         "last_rework_reason": None,
         "rework_streak": 0,
         "replan_required": False,
+        "last_replan_reason": None,
         "plan_revision": 1,
         "plan_file": plan_file,
         "repo": str(repo),
@@ -954,8 +1307,8 @@ def command_init(args: argparse.Namespace) -> None:
         "review": None,
     }
     validate_shape(state)
-    save_state(args.state, state)
-    emit({"ok": True, "state": str(args.state), "run_id": state["run_id"], "phase": state["phase"]})
+    save_state(state_path, state)
+    emit({"ok": True, "state": str(state_path), "run_id": state["run_id"], "phase": state["phase"]})
 
 
 def command_record_plan(args: argparse.Namespace) -> None:
@@ -1077,11 +1430,17 @@ def command_rework(args: argparse.Namespace) -> None:
 
 def command_revise_plan(args: argparse.Namespace) -> None:
     state = load_state(args.state)
-    if state["phase"] != "plan" or not state.get("replan_required", False):
-        raise GateError("REPLAN_NOT_REQUIRED", ["revise-plan requires a forced replan state"])
+    if state["phase"] not in {"plan", "implement", "verify"}:
+        raise GateError("REPLAN_NOT_ALLOWED", ["revise-plan is allowed only during plan, implement, or verify"])
+    reason = (args.reason or "").strip()
+    if not reason and not state.get("replan_required", False):
+        raise GateError("REPLAN_REASON_REQUIRED", ["--reason must be non-empty"])
+    if not reason:
+        reason = state.get("last_rework_reason") or "forced replan after repeated verification failure"
 
     revised_scope = sorted({normalize_path(item) for item in args.write})
-    outside = [path for path in state["changed_files"] if not in_scope(path, revised_scope)]
+    current_paths = current_task_paths(state)
+    outside = [path for path in current_paths if not in_scope(path, revised_scope)]
     if outside:
         raise GateError(
             "REPLAN_SCOPE_CONFLICT",
@@ -1092,7 +1451,8 @@ def command_revise_plan(args: argparse.Namespace) -> None:
     state["goal"] = args.goal.strip()
     state["write_scope"] = revised_scope
     state["risk"] = {"impact": args.impact, "details": args.risk_detail}
-    state["delivery_required"] = args.delivery_required
+    if args.delivery_required is not None:
+        state["delivery_required"] = args.delivery_required
     state["result"] = "pending"
     state["evidence"] = []
     state["gaps"] = []
@@ -1111,7 +1471,11 @@ def command_revise_plan(args: argparse.Namespace) -> None:
         state["reviewer_profile"] = reviewer_name
         state["review"] = None
     state["rework_streak"] = 0
+    state["phase"] = "plan"
     state["replan_required"] = False
+    state["last_replan_reason"] = reason
+    if state.get("schema_version") in {2, 3, 4}:
+        state["changed_files"] = sorted(current_paths)
     state["plan_revision"] = int(state.get("plan_revision", 1)) + 1
     validate_shape(state)
     save_state(args.state, state)
@@ -1149,6 +1513,10 @@ def command_record_evidence(args: argparse.Namespace) -> None:
     state = load_state(args.state)
     if state["phase"] != "verify":
         raise GateError("WRONG_PHASE", ["record-evidence requires verify phase"])
+    worktree_fingerprint = None
+    if state.get("schema_version") in {2, 3, 4}:
+        ensure_current_scope(state)
+        worktree_fingerprint = compute_evidence_fingerprint(state)
     state["evidence"].append(
         {
             "kind": args.kind,
@@ -1159,6 +1527,8 @@ def command_record_evidence(args: argparse.Namespace) -> None:
             "result": args.result,
         }
     )
+    if worktree_fingerprint is not None:
+        state["evidence"][-1]["worktree_fingerprint"] = worktree_fingerprint
     if "review" in state or state.get("schema_version") == CURRENT_SCHEMA_VERSION:
         state["review"] = None
     validate_shape(state)
@@ -1194,6 +1564,11 @@ def command_record_review(args: argparse.Namespace) -> None:
             "REVIEW_NOT_READY",
             ["set verification result to pass or pass_with_gaps before recording the review"],
         )
+    if state.get("schema_version") in {2, 3, 4}:
+        ensure_current_scope(state)
+        evidence_errors = ensure_evidence(state)
+        if evidence_errors:
+            raise GateError("REVIEW_NOT_READY", evidence_errors)
 
     config = load_model_config()
     executor_name, _ = configured_role(config, "executor")
@@ -1276,7 +1651,7 @@ def command_audit(args: argparse.Namespace) -> None:
     if state["schema_version"] in {2, 3, 4}:
         if repo != Path(state["repo"]).resolve():
             raise GateError("AUDIT_REPO_MISMATCH", [str(repo), state["repo"]])
-        actual = task_git_files(state)
+        actual = current_task_paths(state)
     else:
         actual = actual_git_files(repo)
     errors: list[str] = []
@@ -1330,6 +1705,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_markdown_content_source(prepend_requirement)
     prepend_requirement.set_defaults(handler=command_prepend_requirement)
 
+    status = subparsers.add_parser("status", help="show a bounded state summary; never a release gate")
+    status.add_argument("--state", type=Path, required=True)
+    status.add_argument("--limit", type=status_limit, default=20)
+    status.set_defaults(handler=command_status)
+
     init = subparsers.add_parser("init", help="create a run state")
     init.add_argument("--state", type=Path, required=True)
     init.add_argument("--repo", type=Path, required=True)
@@ -1367,7 +1747,11 @@ def build_parser() -> argparse.ArgumentParser:
     revise_plan.add_argument("--write", action="append", default=[])
     revise_plan.add_argument("--impact", choices=sorted(IMPACTS), required=True)
     revise_plan.add_argument("--risk-detail", action="append", default=[])
-    revise_plan.add_argument("--delivery-required", action="store_true")
+    revise_plan.add_argument("--reason")
+    delivery = revise_plan.add_mutually_exclusive_group()
+    delivery.add_argument("--delivery-required", dest="delivery_required", action="store_true")
+    delivery.add_argument("--no-delivery-required", dest="delivery_required", action="store_false")
+    revise_plan.set_defaults(delivery_required=None)
     revise_plan.set_defaults(handler=command_revise_plan)
 
     changes = subparsers.add_parser("set-changes", help="record changed files")

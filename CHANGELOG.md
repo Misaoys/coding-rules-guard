@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Bind v4 Plan records to the actual Plan Markdown bytes and reject missing, changed, or unsafe Plan paths at the completion boundary.
+- Recheck real Git scope at Verify, evidence, review, audit, and Complete; bind evidence to worktree content/mode/link/deletion identity and reject stale evidence.
+- Add NUL-safe Git path handling, bounded batch identity reads, `content-index-v1` baseline markers, and an explicit compatibility slow path for unmarked baselines.
+- Add atomic run-state saves, non-overwriting `init`, bounded `status` snapshots, compact JSON output, and active `revise-plan --reason` without accidental delivery cancellation.
+- Align Verify skill prompts with the current `session_main` role and document upgrade, status, and host-verification boundaries.
+
 ## 0.11.0 - 2026-09-05
 
 - Replaced the fixed GPT-5.6 Sol/xhigh planner with the current session's main model under the `session_main` planning role.

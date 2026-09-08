@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -1179,6 +1180,228 @@ class GuardCliTests(unittest.TestCase):
                 plan.read_text(encoding="utf-8"),
                 "## 新增需求\n\n保存 Plan 到 Markdown。\n\n---\n\n### GOAL\n\nExisting Plan\n",
             )
+
+    def test_plan_content_change_invalidates_the_recorded_plan(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo, target = self.create_repo(root)
+            plan = root / "work" / "plan.md"
+            plan.parent.mkdir()
+            plan.write_text("### GOAL\n\noriginal\n", encoding="utf-8")
+            state = root / "state.json"
+            result = self.run_guard(
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FAST",
+                "--goal", "content-bound plan", "--write", "src/a.py", "--impact", "no_known_impact",
+                "--plan-file", str(plan)
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            result = self.run_guard("record-plan", "--state", str(state))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            plan.write_text("### GOAL\n\nchanged after planning\n", encoding="utf-8")
+            target.write_text("value = 2\n", encoding="utf-8")
+            result = self.run_guard("transition", "--state", str(state), "--to", "implement")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("PLAN_STALE", " ".join(json.loads(result.stdout)["details"]))
+
+            plan.unlink()
+            result = self.run_guard("record-plan", "--state", str(state))
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "PLAN_FILE_MISSING")
+
+    def test_active_replan_requires_reason_and_preserves_delivery_intent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo, target = self.create_repo(root)
+            state = root / "state.json"
+            result = self.run_guard(
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FULL",
+                "--goal", "active replan", "--write", "src/a.py", "--impact", "known_impact",
+                "--delivery-required"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            result = self.run_guard("record-plan", "--state", str(state))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            result = self.run_guard("transition", "--state", str(state), "--to", "implement")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            target.write_text("value = 2\n", encoding="utf-8")
+
+            result = self.run_guard(
+                "revise-plan", "--state", str(state), "--mode", "FULL", "--goal", "new hypothesis",
+                "--write", "src/a.py", "--impact", "known_impact"
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "REPLAN_REASON_REQUIRED")
+
+            result = self.run_guard(
+                "revise-plan", "--state", str(state), "--mode", "FULL", "--goal", "new hypothesis",
+                "--write", "src/a.py", "--impact", "known_impact", "--reason", "new evidence"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(payload["phase"], "plan")
+            self.assertTrue(payload["delivery_required"])
+            self.assertEqual(payload["last_replan_reason"], "new evidence")
+            self.assertEqual(payload["changed_files"], ["src/a.py"])
+
+    def test_init_rejects_overwrite_and_repository_local_state_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo, _ = self.create_repo(root)
+            inside_state = repo / "state.json"
+            result = self.run_guard(
+                "init", "--state", str(inside_state), "--repo", str(repo), "--mode", "FAST",
+                "--goal", "inside state", "--write", "src/a.py", "--impact", "no_known_impact"
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "STATE_FILE_IN_REPOSITORY")
+
+            state = root / "state.json"
+            result = self.run_guard(
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FAST",
+                "--goal", "first state", "--write", "src/a.py", "--impact", "no_known_impact"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            before = state.read_bytes()
+            result = self.run_guard(
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FAST",
+                "--goal", "overwrite attempt", "--write", "src/a.py", "--impact", "no_known_impact"
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "STATE_FILE_EXISTS")
+            self.assertEqual(state.read_bytes(), before)
+
+    def test_status_is_bounded_and_compact_mode_preserves_fields(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo, _ = self.create_repo(root)
+            state = root / "state.json"
+            result = self.run_guard(
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FAST",
+                "--goal", "status snapshot", "--write", "src/a.py", "--write", "src/other.py",
+                "--impact", "no_known_impact"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            before = state.read_bytes()
+            result = self.run_guard("status", "--state", str(state), "--limit", "1")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            snapshot = json.loads(result.stdout)
+            self.assertEqual(snapshot["snapshot"], "state_only_not_a_gate")
+            self.assertEqual(snapshot["paths"]["write_scope"]["total"], 2)
+            self.assertTrue(snapshot["paths"]["write_scope"]["truncated"])
+            self.assertFalse(snapshot["review_recorded"])
+            self.assertEqual(state.read_bytes(), before)
+
+            invalid = self.run_guard("status", "--state", str(state), "--limit", "0")
+            self.assertNotEqual(invalid.returncode, 0)
+            self.assertEqual(state.read_bytes(), before)
+
+            compact_env = os.environ.copy()
+            compact_env["CODING_GUARD_COMPACT"] = "1"
+            compact = subprocess.run(
+                [sys.executable, str(GUARD_PATH), "status", "--state", str(state), "--limit", "1"],
+                capture_output=True, text=True, encoding="utf-8", env=compact_env,
+            )
+            self.assertEqual(compact.returncode, 0, compact.stdout + compact.stderr)
+            self.assertEqual(json.loads(compact.stdout), snapshot)
+            self.assertNotIn("\n  ", compact.stdout)
+
+    def test_git_paths_preserve_spaces_and_literal_brackets(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            rel = "src/space name[.py"
+            repo, target = self.create_repo(root, rel=rel)
+            state = root / "state.json"
+            result = self.run_guard(
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FAST",
+                "--goal", "literal path", "--write", rel, "--impact", "no_known_impact"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            target.write_text("value = 2\n", encoding="utf-8")
+            for command in (
+                ("record-plan", "--state", str(state)),
+                ("transition", "--state", str(state), "--to", "implement"),
+                ("set-changes", "--state", str(state)),
+            ):
+                result = self.run_guard(*command)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(json.loads(state.read_text(encoding="utf-8"))["changed_files"], [rel])
+
+    def test_unknown_baseline_fingerprint_format_blocks_change_detection(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo, target = self.create_repo(root)
+            state = root / "state.json"
+            result = self.run_guard(
+                "init", "--state", str(state), "--repo", str(repo), "--mode", "FAST",
+                "--goal", "unknown format", "--write", "src/a.py", "--impact", "no_known_impact"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(state.read_text(encoding="utf-8"))
+            payload["git_baseline"]["fingerprint_format"] = "future-format"
+            state.write_text(json.dumps(payload), encoding="utf-8")
+            target.write_text("value = 2\n", encoding="utf-8")
+            result = self.run_guard("record-plan", "--state", str(state))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            result = self.run_guard("transition", "--state", str(state), "--to", "implement")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            result = self.run_guard("set-changes", "--state", str(state))
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "GIT_BASELINE_FORMAT_UNKNOWN")
+
+    def test_evidence_cannot_be_reused_by_a_new_review_after_content_drift(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo, state = self.create_verified_run(root)
+            (repo / "src" / "a.py").write_text("value = 3\n", encoding="utf-8")
+            result = self.run_guard(
+                "record-review", "--state", str(state), "--result", "pass", "--observed", "new review"
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "REVIEW_NOT_READY")
+            self.assertIn("EVIDENCE_STALE", " ".join(json.loads(result.stdout)["details"]))
+
+    def test_atomic_state_save_preserves_previous_file_on_replace_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "state.json"
+            original = '{"old": true}\n'
+            path.write_text(original, encoding="utf-8")
+            with patch.object(guard.Path, "replace", side_effect=OSError("replace blocked")):
+                with self.assertRaises(guard.GateError) as raised:
+                    guard.save_state(path, {"new": True})
+            self.assertEqual(raised.exception.code, "STATE_SAVE_FAILED")
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+            self.assertEqual(list(path.parent.glob(f".{path.name}.*.tmp")), [])
+
+    def test_capture_baseline_uses_bounded_git_batches(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = root / "repo"
+            repo.mkdir()
+            self.git(repo, "init", "-b", "main")
+            self.git(repo, "config", "user.name", "Test User")
+            self.git(repo, "config", "user.email", "test@example.invalid")
+            directory = repo / "src"
+            directory.mkdir()
+            for index in range(200):
+                (directory / f"file-{index:03d}.py").write_text(f"value = {index}\n", encoding="utf-8")
+            self.git(repo, "add", "--", "src")
+            self.git(repo, "commit", "-m", "initial")
+            for index in range(200):
+                (directory / f"file-{index:03d}.py").write_text(f"changed = {index}\n", encoding="utf-8")
+
+            original_run = guard.subprocess.run
+            calls = []
+
+            def counted_run(*args, **kwargs):
+                command = args[0] if args else kwargs.get("args", [])
+                if command and command[0] == "git":
+                    calls.append(command)
+                return original_run(*args, **kwargs)
+
+            with patch.object(guard.subprocess, "run", side_effect=counted_run):
+                baseline = guard.capture_git_baseline(repo)
+            self.assertEqual(baseline["fingerprint_format"], "content-index-v1")
+            self.assertLessEqual(len(calls), 10)
 
 
 if __name__ == "__main__":

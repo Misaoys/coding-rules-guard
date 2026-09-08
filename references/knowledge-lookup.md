@@ -9,7 +9,11 @@ Use the documented project KB root when appropriate. Otherwise default to `memor
 Use task entities/identifiers in the query and pass the current repository through `--cwd`:
 
 ```powershell
-py -3 -B -X utf8 "C:\Users\admin\.codex\skills\knowledge-base\scripts\kb_query.py" search --root "C:\Users\admin\.codex\memories" --query "<task entities/identifiers>" --cwd "<current repo>" --top 3 --max-chars 3000 --json
+# Resolve these two locations from the host's configured Codex installation;
+# do not copy a user-specific absolute Windows path into a project skill.
+$KbQuery = "<host-resolved Codex skills>\knowledge-base\scripts\kb_query.py"
+$MemoryRoot = "<host-resolved Codex memory root>"
+py -3 -B -X utf8 $KbQuery search --root $MemoryRoot --query "<task entities/identifiers>" --cwd "<current repo>" --top 3 --max-chars 3000 --json
 ```
 
 `--max-chars 3000` means characters, not tokens; make no 192-token runtime promise. Read only the returned line spans needed for the decision: start with Top 1 and stop once scope, status, and evidence are sufficient.

@@ -161,7 +161,7 @@ Before `rework`, the current attempt must contain a bounded diagnosis that cites
 ```powershell
 python scripts/guard.py record-diagnosis `
   --state .\work\run-state.json `
-  --input .\work\diagnosis.json
+  --input @.\work\diagnosis.json
 ```
 
 `retry-verify` is reserved for a blocked environment or input-data diagnosis with a genuinely new external observation. It archives the blocked attempt and starts a `verify_only` attempt; it never runs a test, changes code, or writes `pass`:
@@ -227,6 +227,8 @@ python scripts/guard.py check-verification --state .\work\run-state.json --check
 ```
 
 The result is only `reuse`, `run`, `diagnose`, `unknown`, or `blocked`. Reuse preserves the original evidence/execution ID and is limited to the same attempt, Plan, definition, complete input binding, and trusted `host_receipt`/`adapter` source. `agent_report` never earns automatic reuse. This CLI has no host-level execution-interception API, so the actual adapter or Skill must consume the query; no command is automatically skipped merely because a query returned `reuse`.
+
+The supported repeat policies are `{"mode":"once"}` and `{"mode":"samples","required_samples":2..16}`. Sample runs need distinct `sample_id` values. A reusable execution record must include matching `before_binding` and `after_binding` objects of the form `{ "binding_digest": "<64 lowercase hex characters>" }`; the query also compares that digest with the current input binding. Missing or changed observations return `unknown`, and a static Plan environment identity is not a current environment observation. One execution may support multiple evidence assertions; only the same assertion is idempotent. An unresolved matching failure is diagnosed before `--force` is honored.
 
 ## Evidence boundary
 

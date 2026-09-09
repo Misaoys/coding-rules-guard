@@ -36,6 +36,7 @@
           "level": { "enum": ["source", "test", "browser", "installed", "host", "production"] },
           "result": { "enum": ["pass", "fail", "blocked"] },
           "worktree_fingerprint": { "type": "string", "minLength": 1 },
+          "assertion_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
           "execution": { "$ref": "#/$defs/execution" }
         },
         "additionalProperties": false
@@ -299,7 +300,17 @@
         "check_id": { "type": ["string", "null"] },
         "binding_digest": { "type": ["string", "null"] },
         "binding": { "type": ["object", "null"] },
-        "sample_id": { "type": "string" }
+        "sample_id": { "type": "string" },
+        "before_binding": { "$ref": "#/$defs/binding_snapshot" },
+        "after_binding": { "$ref": "#/$defs/binding_snapshot" }
+      },
+      "additionalProperties": false
+    },
+    "binding_snapshot": {
+      "type": "object",
+      "required": ["binding_digest"],
+      "properties": {
+        "binding_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
       },
       "additionalProperties": false
     }

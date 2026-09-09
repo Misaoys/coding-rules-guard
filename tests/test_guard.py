@@ -151,6 +151,26 @@ class GuardCliTests(unittest.TestCase):
             [sys.executable, str(GUARD_PATH), *command], capture_output=True, text=True, encoding="utf-8"
         )
 
+    def record_implementation_diagnosis(self, state):
+        payload = json.loads(state.read_text(encoding="utf-8"))
+        evidence = [item for item in payload.get("evidence", []) if item.get("result") == "fail"]
+        refs = [evidence[-1]["evidence_id"]] if evidence else []
+        review = payload.get("review")
+        if isinstance(review, dict) and review.get("result") == "fail":
+            refs.append(review["review_id"])
+        self.assertTrue(refs)
+        diagnosis = {
+            "classification": "implementation",
+            "cause_summary": "the current implementation does not satisfy the observed contract",
+            "source_refs": refs,
+            "next_action_summary": "make the smallest in-scope correction",
+            "next_hypothesis": "the corrected implementation will satisfy the failed observation",
+            "expected_observation": "the failing verification passes after the correction",
+            "new_information": {"kind": "code_change_planned", "summary": "a bounded correction is planned", "source_refs": refs},
+        }
+        result = self.run_guard("record-diagnosis", "--state", str(state), "--input", json.dumps(diagnosis))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def git(self, repo, *args):
         result = subprocess.run(
             ["git", "-C", str(repo), *args], capture_output=True, text=True, encoding="utf-8"
@@ -190,7 +210,7 @@ class GuardCliTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         initialized = json.loads(state.read_text(encoding="utf-8"))
-        self.assertEqual(initialized["schema_version"], 4)
+        self.assertEqual(initialized["schema_version"], 5)
         self.assertTrue(initialized["review_required"])
         self.assertEqual(initialized["planner_profile"], "session_main")
         self.assertIsNone(initialized["plan_record"])
@@ -278,7 +298,8 @@ class GuardCliTests(unittest.TestCase):
             state.write_text(json.dumps(payload), encoding="utf-8")
             result = self.run_guard("transition", "--state", str(state), "--to", "implement")
             self.assertEqual(result.returncode, 2)
-            self.assertIn("PLAN_RECORD_EXPIRED", " ".join(json.loads(result.stdout)["details"]))
+            self.assertEqual(json.loads(result.stdout)["code"], "STATE_SCHEMA_INVALID")
+            self.assertIn("verification_registry.plan_revision", " ".join(json.loads(result.stdout)["details"]))
 
     def test_legacy_plan_states_fail_closed_for_implementation(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -287,13 +308,13 @@ class GuardCliTests(unittest.TestCase):
             result = self.run_guard("record-plan", "--state", str(state))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             payload = json.loads(state.read_text(encoding="utf-8"))
-            for schema_version in (1, 2, 3):
+            for schema_version in (1, 2, 3, 4):
                 payload["schema_version"] = schema_version
                 payload["phase"] = "plan"
                 state.write_text(json.dumps(payload), encoding="utf-8")
                 result = self.run_guard("transition", "--state", str(state), "--to", "implement")
                 self.assertEqual(result.returncode, 2)
-                self.assertIn("PLAN_STATE_UPGRADE_REQUIRED", " ".join(json.loads(result.stdout)["details"]))
+                self.assertEqual(json.loads(result.stdout)["code"], "STATE_UPGRADE_REQUIRED")
 
     def test_planner_configuration_drift_blocks_implementation(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -352,6 +373,7 @@ class GuardCliTests(unittest.TestCase):
             result = self.run_guard("transition", "--state", str(state), "--to", "complete")
             self.assertEqual(result.returncode, 2)
             self.assertIn("reviewer result must be pass", " ".join(json.loads(result.stdout)["details"]))
+            self.record_implementation_diagnosis(state)
             result = self.run_guard(
                 "rework", "--state", str(state), "--reason", "Sol review found an implementation defect"
             )
@@ -407,21 +429,18 @@ class GuardCliTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("REVIEW_STALE", " ".join(json.loads(result.stdout)["details"]))
 
-    def test_v2_review_uses_real_fingerprint_and_becomes_stale(self):
+    def test_v2_review_write_is_rejected_until_state_is_upgraded(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            repo, state = self.create_verified_run(root)
+            _, state = self.create_verified_run(root)
             payload = json.loads(state.read_text(encoding="utf-8"))
             payload["schema_version"] = 2
             state.write_text(json.dumps(payload), encoding="utf-8")
             result = self.run_guard(
                 "record-review", "--state", str(state), "--result", "pass", "--observed", "legacy v2 reviewed"
             )
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            (repo / "src" / "a.py").write_text("value = 4\n", encoding="utf-8")
-            result = self.run_guard("transition", "--state", str(state), "--to", "complete")
             self.assertEqual(result.returncode, 2)
-            self.assertIn("REVIEW_STALE", " ".join(json.loads(result.stdout)["details"]))
+            self.assertEqual(json.loads(result.stdout)["code"], "STATE_UPGRADE_REQUIRED")
 
     def test_set_result_invalidates_an_existing_review(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -540,6 +559,7 @@ class GuardCliTests(unittest.TestCase):
             }
             stale["delivery_audit"] = {"passed": True, "repo": "stale", "checked_files": ["src/a.py"]}
             state.write_text(json.dumps(stale), encoding="utf-8")
+            self.record_implementation_diagnosis(state)
             result = self.run_guard(
                 "rework", "--state", str(state), "--reason", "implementation defect confirmed"
             )
@@ -613,11 +633,13 @@ class GuardCliTests(unittest.TestCase):
                     ("transition", "--state", str(state), "--to", "verify"),
                     ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "runtime", "--command", "run", "--observed", f"attempt {attempt} failed", "--level", "test", "--result", "fail"),
                     ("set-result", "--state", str(state), "--result", "fail"),
-                    ("rework", "--state", str(state), "--reason", f"failed hypothesis {attempt}"),
                 ]
                 for command in commands:
                     result = self.run_guard(*command)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.record_implementation_diagnosis(state)
+                result = self.run_guard("rework", "--state", str(state), "--reason", f"failed hypothesis {attempt}")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 rework_outputs.append(json.loads(result.stdout))
 
             self.assertNotIn("warning", rework_outputs[0])
@@ -671,14 +693,23 @@ class GuardCliTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             target.write_text("value = 2\n", encoding="utf-8")
-            commands = [
+            initial_commands = [
                 ("record-plan", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "implement"),
                 ("set-changes", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "verify"),
                 ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "runtime", "--command", "run", "--observed", "failed", "--level", "test", "--result", "fail"),
                 ("set-result", "--state", str(state), "--result", "fail"),
-                ("rework", "--state", str(state), "--reason", "implementation defect"),
+            ]
+            for command in initial_commands:
+                result = self.run_guard(*command)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            self.record_implementation_diagnosis(state)
+            result = self.run_guard("rework", "--state", str(state), "--reason", "implementation defect")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            successful_commands = [
                 ("set-changes", "--state", str(state)),
                 ("transition", "--state", str(state), "--to", "verify"),
                 ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "runtime", "--command", "run", "--observed", "passed", "--level", "test", "--result", "pass"),
@@ -687,7 +718,7 @@ class GuardCliTests(unittest.TestCase):
                 ("record-review", "--state", str(state), "--result", "pass", "--observed", "Sol xhigh independent review passed"),
                 ("transition", "--state", str(state), "--to", "complete"),
             ]
-            for command in commands:
+            for command in successful_commands:
                 result = self.run_guard(*command)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -890,45 +921,16 @@ class GuardCliTests(unittest.TestCase):
                         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                         self.assertIn("REVIEW_STALE", " ".join(json.loads(result.stdout)["details"]))
 
-    def test_v2_delivery_audit_uses_the_real_review_fingerprint(self):
+    def test_v2_delivery_audit_write_is_rejected_until_state_is_upgraded(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            repo, target = self.create_repo(root)
-            state = root / "state.json"
-            result = self.run_guard(
-                "init", "--state", str(state), "--repo", str(repo), "--mode", "FULL",
-                "--goal", "v2 audit", "--write", "src/a.py", "--impact", "no_known_impact",
-                "--delivery-required"
-            )
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            payload = json.loads(state.read_text(encoding="utf-8"))
-            target.write_text("value = 2\n", encoding="utf-8")
-            self.git(repo, "add", "--", "src/a.py")
-            commands = [
-                ("record-plan", "--state", str(state)),
-                ("transition", "--state", str(state), "--to", "implement"),
-            ]
-            for command in commands:
-                result = self.run_guard(*command)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            _, state = self.create_verified_run(root)
             payload = json.loads(state.read_text(encoding="utf-8"))
             payload["schema_version"] = 2
             state.write_text(json.dumps(payload), encoding="utf-8")
-            commands = [
-                ("set-changes", "--state", str(state)),
-                ("transition", "--state", str(state), "--to", "verify"),
-                ("record-evidence", "--state", str(state), "--kind", "success", "--entry", "unit", "--command", "test", "--observed", "passed", "--level", "test", "--result", "pass"),
-                ("record-evidence", "--state", str(state), "--kind", "boundary", "--entry", "edge", "--command", "edge", "--observed", "passed", "--level", "test", "--result", "pass"),
-                ("set-result", "--state", str(state), "--result", "pass"),
-                ("record-review", "--state", str(state), "--result", "pass", "--observed", "v2 reviewed"),
-                ("transition", "--state", str(state), "--to", "deliver"),
-                ("audit", "--state", str(state), "--repo", str(repo)),
-            ]
-            for command in commands:
-                result = self.run_guard(*command)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            payload = json.loads(state.read_text(encoding="utf-8"))
-            self.assertEqual(payload["delivery_audit"]["task_fingerprint"], payload["review"]["task_fingerprint"])
+            result = self.run_guard("audit", "--state", str(state), "--repo", str(root / "repo"))
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "STATE_UPGRADE_REQUIRED")
 
     def test_delivery_review_rejects_index_worktree_split(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1144,8 +1146,6 @@ class GuardCliTests(unittest.TestCase):
             self.git(repo, "add", "--", "src/a.py")
             self.git(repo, "commit", "-m", "move head")
             result = self.run_guard("transition", "--state", str(state), "--to", "implement")
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            result = self.run_guard("set-changes", "--state", str(state))
             self.assertEqual(result.returncode, 2)
             self.assertEqual(json.loads(result.stdout)["code"], "GIT_BASELINE_MOVED")
 
@@ -1343,8 +1343,6 @@ class GuardCliTests(unittest.TestCase):
             result = self.run_guard("record-plan", "--state", str(state))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             result = self.run_guard("transition", "--state", str(state), "--to", "implement")
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            result = self.run_guard("set-changes", "--state", str(state))
             self.assertEqual(result.returncode, 2)
             self.assertEqual(json.loads(result.stdout)["code"], "GIT_BASELINE_FORMAT_UNKNOWN")
 

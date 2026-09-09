@@ -1,40 +1,17 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/Misaoys/coding-rules-guard/contracts/run-state.schema.json",
-  "title": "Coding Rules Guard run state",
+  "title": "Coding Rules Guard run state v5",
   "type": "object",
   "required": [
-    "schema_version",
-    "run_id",
-    "mode",
-    "phase",
-    "goal",
-    "write_scope",
-    "changed_files",
-    "evidence",
-    "risk",
-    "result",
-    "delivery_required",
-    "gaps_authorized",
-    "gap_authorization",
-    "rework_count",
-    "last_rework_reason",
-    "rework_streak",
-    "replan_required",
-    "plan_revision",
-    "repo",
-    "git_baseline",
-    "change_detection",
-    "delivery_audit",
-    "review_required",
-    "planner_profile",
-    "plan_record",
-    "executor_profile",
-    "reviewer_profile",
-    "review"
+    "schema_version", "run_id", "mode", "phase", "goal", "write_scope", "changed_files", "evidence",
+    "risk", "result", "gaps", "delivery_required", "gaps_authorized", "gap_authorization", "rework_count",
+    "last_rework_reason", "last_replan_reason", "rework_streak", "replan_required", "plan_revision", "repo",
+    "git_baseline", "change_detection", "delivery_audit", "review_required", "planner_profile", "plan_record",
+    "executor_profile", "reviewer_profile", "review", "loop", "telemetry", "verification_registry"
   ],
   "properties": {
-    "schema_version": { "const": 4 },
+    "schema_version": { "const": 5 },
     "run_id": { "type": "string", "minLength": 1 },
     "mode": { "enum": ["FAST", "FULL"] },
     "phase": { "enum": ["plan", "implement", "verify", "deliver", "complete"] },
@@ -43,17 +20,23 @@
     "changed_files": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
     "evidence": {
       "type": "array",
+      "maxItems": 32,
       "items": {
         "type": "object",
-        "required": ["kind", "entry", "command", "observed", "level", "result", "worktree_fingerprint"],
+        "required": ["evidence_id", "attempt_id", "recorded_at", "kind", "entry", "command", "observed", "level", "result", "worktree_fingerprint"],
         "properties": {
+          "evidence_id": { "type": "string", "minLength": 1 },
+          "attempt_id": { "type": "string", "minLength": 1 },
+          "recorded_at": { "type": "string", "format": "date-time" },
+          "check_id": { "type": "string", "minLength": 1 },
           "kind": { "enum": ["success", "boundary"] },
           "entry": { "type": "string", "minLength": 1 },
-          "command": { "type": "string", "minLength": 1 },
-          "observed": { "type": "string", "minLength": 1 },
+          "command": { "type": "string", "minLength": 1, "maxLength": 2048 },
+          "observed": { "type": "string", "minLength": 1, "maxLength": 2048 },
           "level": { "enum": ["source", "test", "browser", "installed", "host", "production"] },
           "result": { "enum": ["pass", "fail", "blocked"] },
-          "worktree_fingerprint": { "type": "string", "minLength": 1 }
+          "worktree_fingerprint": { "type": "string", "minLength": 1 },
+          "execution": { "$ref": "#/$defs/execution" }
         },
         "additionalProperties": false
       }
@@ -71,17 +54,7 @@
     "gaps": { "type": "array", "items": { "type": "string", "minLength": 1 } },
     "delivery_required": { "type": "boolean" },
     "gaps_authorized": { "type": "boolean" },
-    "gap_authorization": {
-      "type": ["object", "null"],
-      "properties": {
-        "authorization_id": { "type": "string", "minLength": 1 },
-        "authorized_by": { "type": "string", "pattern": "^(user|host):" },
-        "authorized_at": { "type": "string", "format": "date-time" },
-        "reason": { "type": "string", "minLength": 1 }
-      },
-      "required": ["authorization_id", "authorized_by", "authorized_at", "reason"],
-      "additionalProperties": false
-    },
+    "gap_authorization": { "$ref": "#/$defs/gap_authorization" },
     "rework_count": { "type": "integer", "minimum": 0 },
     "last_rework_reason": { "type": ["string", "null"] },
     "last_replan_reason": { "type": ["string", "null"] },
@@ -92,53 +65,60 @@
     "repo": { "type": "string", "minLength": 1 },
     "git_baseline": {
       "type": "object",
+      "required": ["head", "files", "content_files", "index_files"],
       "properties": {
         "head": { "type": "string", "minLength": 1 },
-        "files": {
-          "type": "object",
-          "additionalProperties": { "type": "string", "minLength": 1 }
-        },
-        "content_files": {
-          "type": "object",
-          "additionalProperties": { "type": "string", "minLength": 1 }
-        },
-        "index_files": {
-          "type": "object",
-          "additionalProperties": { "type": "string", "minLength": 1 }
-        },
+        "files": { "type": "object", "additionalProperties": { "type": "string", "minLength": 1 } },
+        "content_files": { "type": "object", "additionalProperties": { "type": "string", "minLength": 1 } },
+        "index_files": { "type": "object", "additionalProperties": { "type": "string", "minLength": 1 } },
         "fingerprint_format": { "type": "string", "minLength": 1 }
       },
-      "required": ["head", "files", "content_files", "index_files"],
       "additionalProperties": false
     },
     "change_detection": { "const": "git_baseline" },
     "review_required": { "type": "boolean" },
     "planner_profile": { "type": "string", "minLength": 1 },
+    "plan_record": { "$ref": "#/$defs/plan_record" },
+    "executor_profile": { "type": ["string", "null"] },
+    "reviewer_profile": { "type": "string", "minLength": 1 },
+    "review": { "$ref": "#/$defs/review" },
+    "delivery_audit": { "$ref": "#/$defs/delivery_audit" },
+    "loop": { "$ref": "#/$defs/loop" },
+    "telemetry": { "$ref": "#/$defs/telemetry" },
+    "verification_registry": { "$ref": "#/$defs/verification_registry" }
+  },
+  "$defs": {
+    "gap_authorization": {
+      "type": ["object", "null"],
+      "required": ["authorization_id", "authorized_by", "authorized_at", "reason"],
+      "properties": {
+        "authorization_id": { "type": "string", "minLength": 1 },
+        "authorized_by": { "type": "string", "pattern": "^(user|host):" },
+        "authorized_at": { "type": "string", "format": "date-time" },
+        "reason": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
     "plan_record": {
       "type": ["object", "null"],
+      "required": ["profile", "model", "reasoning_effort", "recorded_at", "plan_revision", "plan_fingerprint"],
       "properties": {
         "profile": { "type": "string", "minLength": 1 },
         "model": { "type": "string", "minLength": 1 },
         "reasoning_effort": { "type": "string", "minLength": 1 },
         "recorded_at": { "type": "string", "format": "date-time" },
         "plan_revision": { "type": "integer", "minimum": 1 },
-        "plan_fingerprint": { "type": "string", "minLength": 1 }
+        "plan_fingerprint": { "type": "string", "minLength": 1 },
+        "verification_spec_digest": { "type": "string", "minLength": 1 }
       },
-      "required": [
-        "profile",
-        "model",
-        "reasoning_effort",
-        "recorded_at",
-        "plan_revision",
-        "plan_fingerprint"
-      ],
       "additionalProperties": false
     },
-    "executor_profile": { "type": ["string", "null"], "minLength": 1 },
-    "reviewer_profile": { "type": "string", "minLength": 1 },
     "review": {
       "type": ["object", "null"],
+      "required": ["review_id", "attempt_id", "profile", "model", "reasoning_effort", "result", "observed", "reviewed_at", "task_fingerprint"],
       "properties": {
+        "review_id": { "type": "string", "minLength": 1 },
+        "attempt_id": { "type": "string", "minLength": 1 },
         "profile": { "type": "string", "minLength": 1 },
         "model": { "type": "string", "minLength": 1 },
         "reasoning_effort": { "type": "string", "minLength": 1 },
@@ -147,18 +127,180 @@
         "reviewed_at": { "type": "string", "format": "date-time" },
         "task_fingerprint": { "type": "string", "minLength": 1 }
       },
-      "required": ["profile", "model", "reasoning_effort", "result", "observed", "reviewed_at", "task_fingerprint"],
       "additionalProperties": false
     },
     "delivery_audit": {
       "type": ["object", "null"],
+      "required": ["passed", "repo", "checked_files", "task_fingerprint"],
       "properties": {
         "passed": { "type": "boolean" },
         "repo": { "type": "string" },
         "checked_files": { "type": "array", "items": { "type": "string" } },
         "task_fingerprint": { "type": "string", "minLength": 1 }
       },
-      "required": ["passed", "repo", "checked_files", "task_fingerprint"],
+      "additionalProperties": false
+    },
+    "diagnosis": {
+      "type": ["object", "null"],
+      "required": [
+        "diagnosis_id", "attempt_id", "plan_revision", "recorded_at", "classification", "cause_summary",
+        "source_refs", "next_action_summary", "next_hypothesis", "expected_observation", "new_information",
+        "source_snapshot", "source_snapshot_digest", "worktree_fingerprint"
+      ],
+      "properties": {
+        "diagnosis_id": { "type": "string", "minLength": 1 },
+        "attempt_id": { "type": "string", "minLength": 1 },
+        "plan_revision": { "type": "integer", "minimum": 1 },
+        "recorded_at": { "type": "string", "format": "date-time" },
+        "classification": { "enum": ["implementation", "hypothesis_or_scope", "verification_contract", "environment", "input_data", "unknown"] },
+        "cause_summary": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "source_refs": { "type": "array", "minItems": 1, "maxItems": 8, "items": { "type": "string", "minLength": 1 } },
+        "next_action_summary": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "next_hypothesis": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "expected_observation": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "new_information": {
+          "type": "object",
+          "required": ["kind", "summary", "source_refs"],
+          "properties": {
+            "kind": { "enum": ["code_change_planned", "contract_correction", "external_change", "scope_change", "none"] },
+            "summary": { "type": "string", "minLength": 1, "maxLength": 512 },
+            "source_refs": { "type": "array", "maxItems": 8, "items": { "type": "string", "minLength": 1 } }
+          },
+          "additionalProperties": false
+        },
+        "source_snapshot": { "type": "object" },
+        "source_snapshot_digest": { "type": "string", "minLength": 1 },
+        "worktree_fingerprint": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "attempt": {
+      "type": "object",
+      "required": ["attempt_id", "plan_revision", "kind", "started_at", "hypothesis", "start_fingerprint", "diagnosis", "evidence_refs", "review_ref"],
+      "properties": {
+        "attempt_id": { "type": "string", "minLength": 1 },
+        "plan_revision": { "type": "integer", "minimum": 1 },
+        "kind": { "enum": ["implement", "verify_only"] },
+        "started_at": { "type": "string", "format": "date-time" },
+        "source_attempt_id": { "type": ["string", "null"] },
+        "hypothesis": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "start_fingerprint": { "type": "string", "minLength": 1 },
+        "diagnosis": { "$ref": "#/$defs/diagnosis" },
+        "evidence_refs": { "type": "array", "items": { "type": "string", "minLength": 1 }, "maxItems": 32 },
+        "review_ref": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "history_attempt": {
+      "allOf": [
+        { "$ref": "#/$defs/attempt" },
+        {
+          "type": "object",
+          "required": ["closed_at", "end_fingerprint", "outcome", "closure_reason", "historical_not_valid_for_gate", "result", "gaps", "gap_authorization", "evidence_snapshot", "review_snapshot"],
+          "properties": {
+            "closed_at": { "type": "string", "format": "date-time" },
+            "end_fingerprint": { "type": ["string", "null"] },
+            "outcome": { "enum": ["fail", "blocked", "superseded", "pass", "pass_with_gaps"] },
+            "closure_reason": { "type": "string", "minLength": 1 },
+            "historical_not_valid_for_gate": { "const": true },
+            "result": { "enum": ["pending", "pass", "pass_with_gaps", "blocked", "fail"] },
+            "gaps": { "type": "array", "items": { "type": "string" } },
+            "gap_authorization": { "$ref": "#/$defs/gap_authorization" },
+            "evidence_snapshot": { "type": "array", "items": { "type": "object" } },
+            "review_snapshot": { "type": ["object", "null"] }
+          }
+        }
+      ]
+    },
+    "loop": {
+      "type": "object",
+      "required": ["format_version", "policy", "attempt_count", "replan_count", "active_attempt", "attempt_history", "plan_history"],
+      "properties": {
+        "format_version": { "const": 1 },
+        "policy": {
+          "type": "object",
+          "required": ["max_attempts", "max_replans"],
+          "properties": {
+            "max_attempts": { "type": "integer", "minimum": 1, "maximum": 20 },
+            "max_replans": { "type": "integer", "minimum": 0, "maximum": 8 }
+          },
+          "additionalProperties": false
+        },
+        "attempt_count": { "type": "integer", "minimum": 0 },
+        "replan_count": { "type": "integer", "minimum": 0 },
+        "active_attempt": { "anyOf": [{ "$ref": "#/$defs/attempt" }, { "type": "null" }] },
+        "attempt_history": { "type": "array", "items": { "$ref": "#/$defs/history_attempt" } },
+        "plan_history": { "type": "array", "items": { "$ref": "#/$defs/plan_history" } }
+      },
+      "additionalProperties": false
+    },
+    "telemetry": {
+      "type": "object",
+      "required": ["format_version", "event_seq", "events_dropped_before_seq", "activity", "events"],
+      "properties": {
+        "format_version": { "const": 1 },
+        "event_seq": { "type": "integer", "minimum": 0 },
+        "events_dropped_before_seq": { "type": "integer", "minimum": 0 },
+        "activity": {
+          "anyOf": [
+            { "type": "null" },
+            { "type": "object", "required": ["text", "source", "recorded_at", "attempt_id", "plan_revision", "phase"], "properties": { "text": { "type": "string", "maxLength": 120 }, "source": { "const": "agent_report" }, "recorded_at": { "type": "string", "format": "date-time" }, "attempt_id": { "type": ["string", "null"] }, "plan_revision": { "type": "integer", "minimum": 1 }, "phase": { "type": "string" } }, "additionalProperties": false }
+          ]
+        },
+        "events": { "type": "array", "maxItems": 20, "items": { "type": "object", "required": ["seq", "time", "type", "plan_revision", "phase", "summary", "source_refs"], "properties": { "seq": { "type": "integer", "minimum": 1 }, "time": { "type": "string", "format": "date-time" }, "type": { "type": "string", "minLength": 1 }, "attempt_id": { "type": ["string", "null"] }, "plan_revision": { "type": "integer", "minimum": 1 }, "phase": { "type": "string" }, "summary": { "type": "string", "maxLength": 240 }, "source_refs": { "type": "array", "items": { "type": "string" } } }, "additionalProperties": false } }
+      },
+      "additionalProperties": false
+    },
+    "verification_registry": {
+      "type": "object",
+      "required": ["format_version", "plan_revision", "definitions", "active_refs"],
+      "properties": {
+        "format_version": { "const": 1 },
+        "plan_revision": { "type": "integer", "minimum": 1 },
+        "definitions": { "type": "array", "maxItems": 32, "items": { "type": "object", "required": ["check_id", "claim_ids", "criterion_digest", "command_spec", "input_spec", "repeat_policy"], "properties": { "check_id": { "type": "string", "minLength": 1 }, "claim_ids": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } }, "criterion_digest": { "type": "string", "minLength": 1 }, "command_spec": { "type": "object" }, "input_spec": { "type": "object" }, "repeat_policy": { "type": "object" } }, "additionalProperties": false } },
+        "active_refs": { "type": "array", "items": {
+          "type": "object",
+          "required": ["check_id", "evidence_id", "execution_id", "attempt_id"],
+          "properties": {
+            "check_id": { "type": "string", "minLength": 1 },
+            "evidence_id": { "type": "string", "minLength": 1 },
+            "execution_id": { "type": ["string", "null"] },
+            "attempt_id": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        } }
+      },
+      "additionalProperties": false
+    },
+    "plan_history": {
+      "type": "object",
+      "required": ["old_revision", "new_revision", "recorded_at", "reason", "attempt_id", "old_plan_fingerprint", "old_goal"],
+      "properties": {
+        "old_revision": { "type": "integer", "minimum": 1 },
+        "new_revision": { "type": "integer", "minimum": 2 },
+        "recorded_at": { "type": "string", "format": "date-time" },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "attempt_id": { "type": ["string", "null"] },
+        "old_plan_fingerprint": { "type": ["string", "null"] },
+        "old_goal": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "execution": {
+      "type": "object",
+      "required": ["execution_id", "source", "started_at", "finished_at", "result", "check_id", "binding_digest", "binding"],
+      "properties": {
+        "execution_id": { "type": "string", "minLength": 1 },
+        "source": { "enum": ["host_receipt", "adapter", "agent_report"] },
+        "started_at": { "type": "string", "format": "date-time" },
+        "finished_at": { "type": "string", "format": "date-time" },
+        "result": { "enum": ["pass", "fail", "blocked"] },
+        "output_ref": { "type": ["string", "null"] },
+        "check_id": { "type": ["string", "null"] },
+        "binding_digest": { "type": ["string", "null"] },
+        "binding": { "type": ["object", "null"] },
+        "sample_id": { "type": "string" }
+      },
       "additionalProperties": false
     }
   },

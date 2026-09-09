@@ -161,7 +161,7 @@ Before `rework`, the current attempt must contain a bounded diagnosis that cites
 ```powershell
 python scripts/guard.py record-diagnosis `
   --state .\work\run-state.json `
-  --input @.\work\diagnosis.json
+  --input "@.\work\diagnosis.json"
 ```
 
 `retry-verify` is reserved for a blocked environment or input-data diagnosis with a genuinely new external observation. It archives the blocked attempt and starts a `verify_only` attempt; it never runs a test, changes code, or writes `pass`:

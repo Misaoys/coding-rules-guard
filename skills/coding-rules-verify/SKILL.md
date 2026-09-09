@@ -5,7 +5,7 @@ description: 阶段 3：执行不可绕过的真实验证，输出短证据卡�
 
 # 阶段 3：Verify
 
-读取 [共享策略](../../references/workflow-policy.md) 和 Implement 提供的状态路径。严格沿 `Sol Plan → Luna WRITE → Verify → 当前会话主模型审核` 检查；验证尽量到达目标运行边界；退出码、固定 success、快照、mock、文件存在、静态检查或构建成功不能单独替代真实行为证据。
+读取 [共享策略](../../references/workflow-policy.md) 和 Implement 提供的状态路径。若本轮涉及失败、环境恢复、诊断或重工，再读取[循环契约](../../references/loop-policy.md)；需要登记或判断重复验证时才读取[验证契约](../../references/verification-policy.md)。严格沿 `session_main Plan → Luna WRITE → Verify → 当前会话主模型审核` 检查；验证尽量到达目标运行边界；退出码、固定 success、快照、mock、文件存在、静态检查或构建成功不能单独替代真实行为证据。
 
 ## 先证据，后修复
 
@@ -16,14 +16,16 @@ description: 阶段 3：执行不可绕过的真实验证，输出短证据卡�
 - 新增测试必须逐项回查 Plan 中的行为契约、现有验证缺口和回归目标；缺失或无法通过真实行为证明其中任一项时，删除该测试而不是再补一层测试代码。
 - 防御性代码必须通过其已声明的故障、宿主契约或外部边界验证；若只能假设风险而不能说明触发条件，删除该防御并在 `GAP` 如实记录未知边界。不得把测试数量或 catch-all 分支当作可靠性证据。
 
+- 对已登记的检查，在真实执行前调用 `guard.py check-verification`。`reuse` 只引用当前 attempt 的原 evidence/execution；`run` 才执行新检查；`diagnose` 保留未解决失败；`unknown` 不能当作通过；`blocked` 停止相应动作。查询不执行测试，且本地 CLI 没有宿主执行拦截能力。
+
 - 代码：走真实入口，检查输入→输出、状态/副作用和错误语义。
 - UI/浏览器：实际交互；用户要求物理输入时使用真实鼠标/键盘。
 - CEP/AE/原生：到达真实宿主、原生窗口或目标运行时。
 - 安装/发布：加载、安装、启动/重启或产物检查，并核对当前版本。
 
-至少记录成功路径和一个关键失败/边界路径。用 `guard.py record-evidence` 分别记录，随后用 `guard.py set-result` 写入 `pass / pass_with_gaps / blocked / fail`。缺少目标层证据时必须写明 GAP。`set-result` 只能申请 `pass_with_gaps`，不能同时批准；Agent 必须停下等待用户或宿主明确接受，再由独立的 `guard.py authorize-gaps --authorized-by user:<身份> --reason <原因>` 记录机器时间与授权。没有独立授权记录不得 Complete 或 Deliver。证据只写入运行状态；不得额外生成测试报告、验证报告或总结文档。
+至少记录成功路径和一个关键失败/边界路径。用 `guard.py record-evidence` 分别记录；CLI 会把证据绑定到当前任务路径的工作区内容、模式、符号链接目标和删除身份，随后用 `guard.py set-result` 写入 `pass / pass_with_gaps / blocked / fail`。缺少目标层证据时必须写明 GAP。`set-result` 只能申请 `pass_with_gaps`，不能同时批准；Agent 必须停下等待用户或宿主明确接受，再由独立的 `guard.py authorize-gaps --authorized-by user:<身份> --reason <原因>` 记录机器时间与授权。没有独立授权记录不得 Complete 或 Deliver。证据只写入运行状态；不得额外生成测试报告、验证报告或总结文档。
 
-若影响评估指出调用方、相邻功能或公共契约可能受影响，覆盖风险最高的未受影响路径；无法覆盖时如实记录 GAP。确认实现缺陷时先记录失败证据并设置 `fail`，再执行 `guard.py rework --reason <原因>`。收到 `REPLAN_RECOMMENDED` 时重新检查假设；收到 `REPLAN_REQUIRED` 时停止返工并回到 Plan。命令会清除失效结果、证据和授权，修改后必须重新进入 Verify，不以先前通过代替复检。
+若影响评估指出调用方、相邻功能或公共契约可能受影响，覆盖风险最高的未受影响路径；无法覆盖时如实记录 GAP。确认实现缺陷时先记录失败证据、设置 `fail`、写入当前诊断，再执行 `guard.py rework --reason <原因>`。收到 `REPLAN_RECOMMENDED` 或 `NO_NEW_INFORMATION` 时重新检查假设；收到 `REPLAN_REQUIRED` 时停止返工并回到 Plan。环境／输入阻塞只有在记录新外部观察后才可 `retry-verify`。命令会清除失效结果、证据和授权，修改后必须重新进入 Verify，不以先前通过代替复检。
 
 所有有 WRITE 的任务在 `set-result` 后必须由当前会话主模型以 `session_main` 审核。需要正式交付时，先用显式路径暂存全部任务文件并确保任务路径不存在 index/worktree 分叉，再由当前会话主模型检查将要提交的 staged delta；无需交付时检查当前 worktree delta。随后执行 `guard.py record-review --profile session_main --model <CURRENT_SESSION_MAIN_MODEL> --reasoning-effort <CURRENT_SESSION_MAIN_REASONING> --result <pass|fail|blocked> --observed <结论>`。任何后续文件、index、证据、结果或返工变化都会使 review 失效；缺失、失败、主模型信息缺失或 Git delta 指纹过期的 review 会被机器门禁阻止。CLI 记录不能替代宿主级调用者身份认证，也不能密码学证明主会话模型身份。只读任务不创建子代理或 run-state，除非明确需要机器审计。
 

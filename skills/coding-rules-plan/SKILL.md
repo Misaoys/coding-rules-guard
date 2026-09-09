@@ -7,7 +7,7 @@ description: 阶段 1：选择 FAST/FULL，压缩范围、证据、模型和回�
 
 只理解、判断和规划；不改业务文件、不提交、不创建子代理。先读取 [共享策略](../../references/workflow-policy.md)，由当前会话主模型以 `session_main` 完成初始 Plan，并记录宿主显示的实际模型与推理强度；信息不可得时阻断，不得回退为固定 Sol/xhigh。将恰好 7 个 Markdown 小节直接写入任务工作目录的 Plan Markdown。标题独占一行，字段之间空一行；不要输出总标题、完整日志或卡片外结语。
 
-开始规划前，若项目历史、既有约定、已知修复或 runbook 可能改变判断，按[知识库查询](../../references/knowledge-lookup.md)执行一次有界 Query；简单自包含任务跳过，并复用命中路径、行号和必要结论。
+开始规划前，若项目历史、既有约定、已知修复或 runbook 可能改变判断，按[知识库查询](../../references/knowledge-lookup.md)执行一次有界 Query；简单自包含任务跳过，并复用命中路径、行号和必要结论。若接手已有失败或 `REPLAN_REQUIRED` 状态，再读取[循环契约](../../references/loop-policy.md)；不要为正常初始 Plan 加载完整循环历史。
 
 ```markdown
 ### MODE
@@ -51,7 +51,7 @@ description: 阶段 1：选择 FAST/FULL，压缩范围、证据、模型和回�
 
 收到新需求时，必须复用同一 `PLAN_FILE`，先用 `guard.py prepend-requirement --file <PLAN_FILE> --content-file <REQUIREMENT_FILE>` 将需求原样添加到现有 Markdown 顶部；不得覆盖旧 Plan、另建脱节的第二份 Plan 或只在聊天中说明。新需求若改变 MODE、GOAL、WRITE、VERIFY 或 RISK，随后重新调用 planner，并按现有 replan/record-plan 门禁更新运行状态。
 
-`VERIFY` 必须写明先运行的、能区分当前假设的最小真实入口或已有测试。先拿一次有效结果，再决定是否修复、补测试或停止；禁止为了制造“先红后绿”而编写明知错误的测试，也禁止并列堆砌对同一假设没有新增信息的测试。
+`VERIFY` 必须写明先运行的、能区分当前假设的最小真实入口或已有测试；如需保守复用，补充 claim、检查定义、完整输入边界、依赖覆盖和必须重测条件。先拿一次有效结果，再决定是否修复、补测试或停止；禁止为了制造“先红后绿”而编写明知错误的测试，也禁止并列堆砌对同一假设没有新增信息的测试。
 
 测试或防御决策缺少具体契约与触发依据时，`WRITE` 必须明确为“不新增测试/防御代码”。不得以覆盖率、猜测的边界、私有实现、未来可能性或“更稳妥”为理由扩展范围；只有已复现故障、已文档化宿主/协议契约或明确外部信任边界可以成为新增最小防御的依据。
 

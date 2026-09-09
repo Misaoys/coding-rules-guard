@@ -41,10 +41,20 @@
 
 ## 机器信任边界
 
-- 新运行必须在 `guard.py init --repo <仓库>` 记录 Git HEAD 和已有脏文件指纹。v4 状态还必须记录 planner profile；Plan 完成后使用 `guard.py record-plan` 写入 planner/model/reasoning、Plan revision 和绑定 `run_id`、repo、baseline HEAD、MODE、GOAL、WRITE、RISK、delivery flag 的 fingerprint。`plan → implement` 会重新校验配置、记录、revision 和 fingerprint；无记录、过期、篡改或配置漂移均阻断。`set-changes` 不接收 Agent 声明的文件列表，而是自动计算相对 baseline 的任务差异；未被任务触碰的既有脏文件不计入本任务，任务继续修改既有脏文件则会被识别。
+- 新运行必须在 `guard.py init --repo <仓库>` 记录 Git HEAD 和已有脏文件指纹，并创建 run-state v5 的 loop、telemetry 与 verification registry。v5 状态还必须记录 planner profile；Plan 完成后使用 `guard.py record-plan` 写入 planner/model/reasoning、Plan revision 和绑定 `run_id`、repo、baseline HEAD、MODE、GOAL、WRITE、RISK、delivery flag 及验证定义摘要的 fingerprint。`plan → implement` 会重新校验配置、记录、revision、预算和 fingerprint；无记录、过期、篡改或配置漂移均阻断。`set-changes` 不接收 Agent 声明的文件列表，而是自动计算相对 baseline 的任务差异；未被任务触碰的既有脏文件不计入本任务，任务继续修改既有脏文件则会被识别。旧 v1-v4 状态可读但所有写状态命令必须返回 `STATE_UPGRADE_REQUIRED`。
 - baseline 后 Git HEAD 改变时停止并要求新建状态，避免跨提交或切分支掩盖改动。
 - `set-result pass_with_gaps` 只提出缺口，不授权。只有独立的 `authorize-gaps` 能写入机器时间、授权者和原因；Agent 不得把自己声明为用户或宿主。缺少授权记录不能 Complete 或 Deliver。
+- 新基线使用 `git_baseline.fingerprint_format = "content-index-v1"`；缺少标记的旧基线只走明确的兼容慢路径，未知标记直接阻断。Plan 正文、证据工作区身份和实际任务路径都必须在相应放行点重新核对。
+- `status --limit`、`context` 和 `progress` 只输出确定性状态投影，返回 `snapshot: state_only_not_a_gate`；它们不改变状态、不代替 Git 检查、不运行测试或模型，截断只影响展示，不影响真实 WRITE 范围。`set-activity --text` 只写入最多120字符的非门禁提示，不接受 phase、预算、完成率或证据补丁。`CODING_GUARD_COMPACT=1` 只压缩 JSON 空白，不删字段。
+- `revise-plan --reason` 可在 `plan`、`implement`、`verify` 主动触发重规划；原因必须持久保存，新的完整 MODE/GOAL/WRITE/RISK 和交付意图不能遗漏实时已发生改动。强制三次返工仍保持原有 `REPLAN_REQUIRED` 门禁。
 
 ## 阶段
 
-正常路径是 `当前会话主模型 Plan → Luna WRITE → Verify → 当前会话主模型审核 → complete`；只有需要 Git、安装、发布、版本核对或正式交付时走 `verify → deliver → complete`。Verify 确认实现缺陷后，先记录失败证据，再执行 `guard.py rework --reason <原因>`。第一次返回 Implement；同一 Plan 第二次连续返工返回 `REPLAN_RECOMMENDED` 警告；第三次返回 Plan、清除旧 `plan_record` 并设置 `REPLAN_REQUIRED`，此时普通 transition 不能重新进入 Implement，必须用 `guard.py revise-plan` 更新模式、目标、WRITE 和风险，然后重新 `record-plan`。修订 Plan 或成功完成 Verify 后 `rework_streak` 归零，累计 `rework_count` 不清零。旧 v1-v3 若停在 Plan 阶段不得直接进入 Implement，必须创建 v4 run-state。状态文件放在任务临时目录，不写入或暂存到业务仓库。
+正常路径是 `当前会话主模型 Plan → Luna WRITE → Verify → 当前会话主模型审核 → complete`；只有需要 Git、安装、发布、版本核对或正式交付时走 `verify → deliver → complete`。Verify 确认实现缺陷后，先记录失败证据和当前 attempt 的诊断，再执行 `guard.py rework --reason <原因>`。第一次返回 Implement；同一 Plan 第二次连续返工返回 `REPLAN_RECOMMENDED` 警告；第三次返回 Plan、清除旧 `plan_record` 并设置 `REPLAN_REQUIRED`，此时普通 transition 不能重新进入 Implement，必须用 `guard.py revise-plan` 更新模式、目标、WRITE 和风险，然后重新 `record-plan`。若环境或输入前置条件阻塞，只有记录新外部观察后才允许 `retry-verify` 开启 `verify_only` attempt；它不执行测试、不改代码。修订 Plan 或成功完成 Verify 后 `rework_streak` 归零，累计 `rework_count` 不清零。总 attempt/replan 预算不会因返工、恢复或换模型重置；最后已开始的 attempt 仍可完成。旧 v1-v4 状态不得写入，必须建立 v5 run-state。状态文件放在任务临时目录，不写入或暂存到业务仓库。
+
+## 循环、进度与验证查询
+
+- 失败、阻塞、superseded 和最终完成的 attempt 都进入有界历史；历史项标记 `historical_not_valid_for_gate`，不能为当前轮凑成功或边界证据。`record-diagnosis` 只接受当前 attempt 的 evidence/review ID，并绑定 Plan revision、工作区指纹和来源快照；后续证据、结果、代码或范围变化会使它失效。
+- `context` 的 `verification_summary.freshness` 固定为 `not_revalidated`。只有 `check-verification` 才能给出 `reuse/run/diagnose/unknown/blocked` 查询结果；查询不运行检查、不写 state，调用方必须重新遵守 Verify、review、交付和权限门禁。
+- `verification_registry` 只保存 Plan 绑定的检查定义和当前 evidence/execution 引用，不保存永久 `valid`。同一 attempt、同一 Plan、同一完整输入绑定下，带可信 `host_receipt` 或 `adapter` 来源的通过证据才可建议复用；`agent_report` 只能作为观察，不能自动复用。
+- 进度事件最多保留20条，activity最多120个Unicode字符；它们不参与 Plan、evidence、review、diagnosis、预算或任务指纹。拒绝或失败的命令不得为了写事件而修改旧 state。没有原生宿主进度 API 时，宿主／聊天只展示基于 `display_line` 或 `progress` 的一两句事实回退，不显示百分比或 ETA。

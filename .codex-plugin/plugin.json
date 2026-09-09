@@ -1,7 +1,7 @@
 {
   "name": "coding-rules-guard",
-  "version": "0.12.0+codex.20260905090704",
-  "description": "Risk-routed workflow with strict minimal testing and current-session-main-model Plan and review gates.",
+  "version": "0.13.0",
+  "description": "Risk-routed workflow with bounded v5 attempts, evidence-bound diagnosis, progress projections, and conservative verification reuse queries.",
   "author": {
     "name": "Misaoys"
   },
@@ -16,8 +16,8 @@
   ],
   "interface": {
     "displayName": "Coding Rules Guard",
-    "shortDescription": "Current-session-main Plan, Luna Max WRITE, and review gates.",
-    "longDescription": "Coding Rules Guard routes low-risk work through a short FAST path, escalates cross-layer or high-risk work to FULL, and requires the current session's main model to create and review every write Plan. Each record names that model and its reasoning effort; it never falls back to fixed Sol/xhigh planning or review.",
+    "shortDescription": "V5 bounded workflow, progress, and evidence gates.",
+    "longDescription": "Coding Rules Guard routes low-risk work through a short FAST path, escalates cross-layer or high-risk work to FULL, and requires the current session's main model to create and review every write Plan. V5 adds bounded attempts and replans, source-bound diagnosis, read-only progress/context, and conservative same-attempt verification queries. It never pretends to provide host-level identity or execution interception.",
     "developerName": "Misaoys",
     "category": "Productivity",
     "composerIcon": "./assets/coding-icon-light.svg",
@@ -29,6 +29,6 @@
       "Verify",
       "Deliver"
     ],
-    "defaultPrompt": "Choose FAST or FULL, load only the current coding-rules phase, and use the current session main model as session_main for both Plan and final review, recording its actual model and reasoning effort at each gate. Do not fall back to fixed Sol/xhigh planning or review. Do not create reports, summaries, status documents, or test write-ups unless the user explicitly requests them."
+    "defaultPrompt": "Choose FAST or FULL, load only the current coding-rules phase, and use the current session main model as session_main for both Plan and final review, recording its actual model and reasoning effort at each gate. Use v5 bounded attempt/replan budgets; load loop-policy only for failure, recovery, or replan; query registered checks before repeating them. Do not fall back to fixed Sol/xhigh planning or review, claim host execution interception, or create reports unless the user explicitly requests them."
   }
 }

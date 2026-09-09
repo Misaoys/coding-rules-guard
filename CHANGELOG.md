@@ -2,11 +2,16 @@
 
 ## Unreleased
 
-- Bind v4 Plan records to the actual Plan Markdown bytes and reject missing, changed, or unsafe Plan paths at the completion boundary.
-- Recheck real Git scope at Verify, evidence, review, audit, and Complete; bind evidence to worktree content/mode/link/deletion identity and reject stale evidence.
-- Add NUL-safe Git path handling, bounded batch identity reads, `content-index-v1` baseline markers, and an explicit compatibility slow path for unmarked baselines.
-- Add atomic run-state saves, non-overwriting `init`, bounded `status` snapshots, compact JSON output, and active `revise-plan --reason` without accidental delivery cancellation.
-- Align Verify skill prompts with the current `session_main` role and document upgrade, status, and host-verification boundaries.
+- Upgrade new run states to schema v5 with bounded total `max_attempts`/`max_replans` budgets, append-only attempt and Plan history, and explicit legacy read-only rejection (`STATE_UPGRADE_REQUIRED`) for writes.
+- Add source-bound diagnosis, bounded `rework`, `revise-plan`, and environment-only `retry-verify` lifecycle gates; failed, blocked, superseded, and completed attempts are archived without making historical evidence current.
+- Add deterministic read-only `context`/`progress`, short `set-activity`, bounded telemetry events, and display-line output. Progress does not run Git/tests/models, create percentages/ETAs, or change release gates.
+- Add optional Plan-bound verification definitions, execution/input bindings, idempotent execution registration, and read-only `check-verification` decisions (`reuse`, `run`, `diagnose`, `unknown`, `blocked`). Only trusted host/adapter receipts can be reused; this release has no host execution-interception API.
+- Complete G-01/G-02/G-03 Git hardening: porcelain-v1 NUL status parsing, conflict/stage rejection, index/tree/content/type/mode identities, unsupported object errors, scoped command-local snapshots, and post-commit residual checks.
+- Keep the original Plan/evidence/review/delivery gates, atomic state save, non-overwriting `init`, content-index baseline marker, and active `revise-plan --reason` behavior. The optional G-11 graph projection is intentionally not implemented.
+
+## 0.13.0 - 2026-09-09
+
+- First v5 development-adjustments release candidate for the bounded loop, progress projection, and conservative verification-query contracts.
 
 ## 0.11.0 - 2026-09-05
 

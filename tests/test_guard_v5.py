@@ -916,6 +916,9 @@ class GuardV5Tests(unittest.TestCase):
         self.assertTrue((package / "__init__.py").is_file())
         self.assertTrue((package / "verification.py").is_file())
         self.assertTrue((package / "projections.py").is_file())
+        self.assertTrue((package / "loop.py").is_file())
+        guard_module = (package / "guard.py").read_text(encoding="utf-8")
+        self.assertIn("from .loop import", guard_module)
         entrypoint = (ROOT / "scripts" / "guard.py").read_text(encoding="utf-8")
         self.assertIn("from guardlib.guard import main", entrypoint)
 

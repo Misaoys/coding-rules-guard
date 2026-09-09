@@ -4,6 +4,7 @@
 
 - Reject stale rework diagnoses after new evidence or result changes, route hypothesis/scope diagnoses to `revise-plan`, and carry `next_hypothesis` into the next implementation attempt.
 - Require `sample_id` when registering executions for multi-sample checks, handle legacy incomplete sample records explicitly, and prioritize diagnosis-linked failures plus nested execution output references in context projections.
+- Extract bounded attempt-loop state helpers into `scripts/guardlib/loop.py` while preserving the direct CLI entrypoint and compatibility wrappers.
 - Upgrade new run states to schema v5 with bounded total `max_attempts`/`max_replans` budgets, append-only attempt and Plan history, and explicit legacy read-only rejection (`STATE_UPGRADE_REQUIRED`) for writes.
 - Add source-bound diagnosis, bounded `rework`, `revise-plan`, and environment-only `retry-verify` lifecycle gates; failed, blocked, superseded, and completed attempts are archived without making historical evidence current.
 - Add deterministic read-only `context`/`progress`, short `set-activity`, bounded telemetry events, and display-line output. Progress does not run Git/tests/models, create percentages/ETAs, or change release gates.

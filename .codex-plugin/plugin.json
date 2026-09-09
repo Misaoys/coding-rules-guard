@@ -1,7 +1,7 @@
 {
   "name": "coding-rules-guard",
-  "version": "0.13.0",
-  "description": "Risk-routed workflow with bounded v5 attempts, evidence-bound diagnosis, progress projections, and conservative verification reuse queries.",
+  "version": "0.14.0",
+  "description": "Risk-routed workflow with bounded v5 attempts, stable evidence bindings, compact handoffs, progress projections, and conservative verification reuse queries.",
   "author": {
     "name": "Misaoys"
   },
@@ -16,8 +16,8 @@
   ],
   "interface": {
     "displayName": "Coding Rules Guard",
-    "shortDescription": "V5 bounded workflow, progress, and evidence gates.",
-    "longDescription": "Coding Rules Guard routes low-risk work through a short FAST path, escalates cross-layer or high-risk work to FULL, and requires the current session's main model to create and review every write Plan. V5 adds bounded attempts and replans, source-bound diagnosis, read-only progress/context, and conservative same-attempt verification queries. It never pretends to provide host-level identity or execution interception.",
+    "shortDescription": "V5 bounded workflow, stable verification, and compact handoffs.",
+    "longDescription": "Coding Rules Guard routes low-risk work through a short FAST path, escalates cross-layer or high-risk work to FULL, and requires the current session's main model to create and review every write Plan. V5 adds bounded attempts and replans, source-bound diagnosis, stable before/after verification bindings, repeat-policy sampling, compact handoff projections, and conservative same-attempt verification queries. It never pretends to provide host-level identity or execution interception.",
     "developerName": "Misaoys",
     "category": "Productivity",
     "composerIcon": "./assets/coding-icon-light.svg",
@@ -29,6 +29,6 @@
       "Verify",
       "Deliver"
     ],
-    "defaultPrompt": "Choose FAST or FULL, load only the current coding-rules phase, and use the current session main model as session_main for both Plan and final review, recording its actual model and reasoning effort at each gate. Use v5 bounded attempt/replan budgets; load loop-policy only for failure, recovery, or replan; query registered checks before repeating them. Do not fall back to fixed Sol/xhigh planning or review, claim host execution interception, or create reports unless the user explicitly requests them."
+    "defaultPrompt": "Choose FAST or FULL, load only the current coding-rules phase, and use the current session main model as session_main for both Plan and final review, recording its actual model and reasoning effort at each gate. Use v5 bounded attempt/replan budgets; load loop-policy only for failure, recovery, or replan; query registered checks before repeating them and require stable before/after/current input bindings. Do not fall back to fixed Sol/xhigh planning or review, claim host execution interception, or create reports unless the user explicitly requests them."
   }
 }

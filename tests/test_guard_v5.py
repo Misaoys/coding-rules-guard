@@ -353,6 +353,15 @@ class GuardV5Tests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as temp_dir:
             repo, target, state_path = self.start_verify(Path(temp_dir), spec)
+            sys.path.insert(0, str(ROOT / "scripts"))
+            try:
+                import guard
+
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                definition = guard.verification_definition(state, "unit")
+                digest = guard.verification_input_binding(state, definition, {})["digest"]
+            finally:
+                sys.path.pop(0)
             execution = {
                 "execution_id": "x001",
                 "source": "host_receipt",
@@ -361,6 +370,8 @@ class GuardV5Tests(unittest.TestCase):
                 "result": "pass",
                 "output_ref": "test-output.txt",
                 "check_id": "unit",
+                "before_binding": {"binding_digest": digest},
+                "after_binding": {"binding_digest": digest},
             }
             result = self.run_guard(
                 "record-evidence", "--state", str(state_path), "--kind", "success", "--entry", "unit",
@@ -382,6 +393,296 @@ class GuardV5Tests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertEqual(payload["decision"], "run")
             self.assertIn("force", payload["reason_codes"])
+
+    def test_verification_reuse_rejects_changed_execution_bindings(self):
+        spec = {
+            "definitions": [
+                {
+                    "check_id": "unit",
+                    "claim_ids": ["claim.unit"],
+                    "criterion_digest": "criterion-v1",
+                    "command_spec": {"argv": ["python", "-m", "unittest"], "cwd": "repo", "runner": "local"},
+                    "input_spec": {"paths": ["src/a.py"], "dependency_coverage": "declared"},
+                    "repeat_policy": {"mode": "once"},
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo, target, state_path = self.start_verify(Path(temp_dir), spec)
+            sys.path.insert(0, str(ROOT / "scripts"))
+            try:
+                import guard
+
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                definition = guard.verification_definition(state, "unit")
+                before_digest = guard.verification_input_binding(state, definition, {})["digest"]
+            finally:
+                sys.path.pop(0)
+            target.write_text("value = 3\n", encoding="utf-8")
+            sys.path.insert(0, str(ROOT / "scripts"))
+            try:
+                import guard
+
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                definition = guard.verification_definition(state, "unit")
+                after_digest = guard.verification_input_binding(state, definition, {})["digest"]
+            finally:
+                sys.path.pop(0)
+            execution = {
+                "execution_id": "x-binding-change",
+                "source": "host_receipt",
+                "argv": ["python", "-m", "unittest"],
+                "cwd": str(repo),
+                "result": "pass",
+                "before_binding": {"binding_digest": before_digest},
+                "after_binding": {"binding_digest": after_digest},
+            }
+            result = self.run_guard(
+                "record-evidence", "--state", str(state_path), "--kind", "success", "--entry", "unit",
+                "--command", "python -m unittest", "--observed", "passed", "--level", "test", "--result", "pass",
+                "--check-id", "unit", "--execution-record", json.dumps(execution),
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            result = self.run_guard("check-verification", "--state", str(state_path), "--check-id", "unit")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["decision"], "unknown")
+            self.assertIn("EXECUTION_BINDING_CHANGED", payload["reason_codes"])
+
+    def test_repeat_policy_requires_distinct_trusted_samples_before_reuse(self):
+        spec = {
+            "definitions": [
+                {
+                    "check_id": "unit",
+                    "claim_ids": ["claim.unit"],
+                    "criterion_digest": "criterion-v1",
+                    "command_spec": {"argv": ["python", "-m", "unittest"], "cwd": "repo", "runner": "local"},
+                    "input_spec": {"paths": ["src/a.py"], "dependency_coverage": "declared"},
+                    "repeat_policy": {"mode": "samples", "required_samples": 2},
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo, _, state_path = self.start_verify(Path(temp_dir), spec)
+            sys.path.insert(0, str(ROOT / "scripts"))
+            try:
+                import guard
+
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                definition = guard.verification_definition(state, "unit")
+                digest = guard.verification_input_binding(state, definition, {})["digest"]
+            finally:
+                sys.path.pop(0)
+
+            def record(sample_id, execution_id):
+                execution = {
+                    "execution_id": execution_id,
+                    "sample_id": sample_id,
+                    "source": "host_receipt",
+                    "argv": ["python", "-m", "unittest"],
+                    "cwd": str(repo),
+                    "result": "pass",
+                    "before_binding": {"binding_digest": digest},
+                    "after_binding": {"binding_digest": digest},
+                }
+                result = self.run_guard(
+                    "record-evidence", "--state", str(state_path), "--kind", "success", "--entry", sample_id,
+                    "--command", "python -m unittest", "--observed", "passed", "--level", "test", "--result", "pass",
+                    "--check-id", "unit", "--execution-record", json.dumps(execution),
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            record("sample-1", "x-sample-1")
+            result = self.run_guard("check-verification", "--state", str(state_path), "--check-id", "unit")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["decision"], "run")
+            self.assertIn("REPEAT_SAMPLES_INSUFFICIENT", payload["reason_codes"])
+            record("sample-2", "x-sample-2")
+            result = self.run_guard("check-verification", "--state", str(state_path), "--check-id", "unit")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(json.loads(result.stdout)["decision"], "reuse")
+
+    def test_force_does_not_bypass_matching_failure(self):
+        spec = {
+            "definitions": [
+                {
+                    "check_id": "unit",
+                    "claim_ids": ["claim.unit"],
+                    "criterion_digest": "criterion-v1",
+                    "command_spec": {"argv": ["python", "-m", "unittest"], "cwd": "repo", "runner": "local"},
+                    "input_spec": {"paths": ["src/a.py"], "dependency_coverage": "declared"},
+                    "repeat_policy": {"mode": "once"},
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo, _, state_path = self.start_verify(Path(temp_dir), spec)
+            sys.path.insert(0, str(ROOT / "scripts"))
+            try:
+                import guard
+
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                definition = guard.verification_definition(state, "unit")
+                digest = guard.verification_input_binding(state, definition, {})["digest"]
+            finally:
+                sys.path.pop(0)
+            execution = {
+                "execution_id": "x-failed",
+                "source": "host_receipt",
+                "argv": ["python", "-m", "unittest"],
+                "cwd": str(repo),
+                "result": "fail",
+                "before_binding": {"binding_digest": digest},
+                "after_binding": {"binding_digest": digest},
+            }
+            result = self.run_guard(
+                "record-evidence", "--state", str(state_path), "--kind", "boundary", "--entry", "unit",
+                "--command", "python -m unittest", "--observed", "failed", "--level", "test", "--result", "fail",
+                "--check-id", "unit", "--execution-record", json.dumps(execution),
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            result = self.run_guard(
+                "check-verification", "--state", str(state_path), "--check-id", "unit", "--force", "--reason", "fresh sample requested"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["decision"], "diagnose")
+            self.assertIn("FORCE_CANNOT_BYPASS_FAILURE", payload["reason_codes"])
+
+    def test_same_execution_can_back_multiple_evidence_assertions_but_same_assertion_is_idempotent(self):
+        spec = {
+            "definitions": [
+                {
+                    "check_id": "unit",
+                    "claim_ids": ["claim.unit"],
+                    "criterion_digest": "criterion-v1",
+                    "command_spec": {"argv": ["python", "-m", "unittest"], "cwd": "repo", "runner": "local"},
+                    "input_spec": {"paths": ["src/a.py"], "dependency_coverage": "declared"},
+                    "repeat_policy": {"mode": "once"},
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo, _, state_path = self.start_verify(Path(temp_dir), spec)
+            sys.path.insert(0, str(ROOT / "scripts"))
+            try:
+                import guard
+
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                definition = guard.verification_definition(state, "unit")
+                digest = guard.verification_input_binding(state, definition, {})["digest"]
+            finally:
+                sys.path.pop(0)
+            execution = {
+                "execution_id": "x-shared",
+                "source": "host_receipt",
+                "argv": ["python", "-m", "unittest"],
+                "cwd": str(repo),
+                "result": "pass",
+                "before_binding": {"binding_digest": digest},
+                "after_binding": {"binding_digest": digest},
+            }
+            first = (
+                "record-evidence", "--state", str(state_path), "--kind", "success", "--entry", "success path",
+                "--command", "python -m unittest", "--observed", "passed", "--level", "test", "--result", "pass",
+                "--check-id", "unit", "--execution-record", json.dumps(execution),
+            )
+            result = self.run_guard(*first)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            second = list(first)
+            second[second.index("--kind") + 1] = "boundary"
+            second[second.index("--entry") + 1] = "boundary path"
+            result = self.run_guard(*second)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertNotIn("idempotent", payload)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(state["evidence"]), 2)
+            self.assertEqual(state["evidence"][0]["execution"]["execution_id"], "x-shared")
+            self.assertEqual(state["evidence"][1]["execution"]["execution_id"], "x-shared")
+            result = self.run_guard(*first)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(json.loads(result.stdout)["idempotent"])
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(state["evidence"]), 2)
+
+    def test_context_history_is_a_compact_handoff_projection(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        try:
+            import guard
+
+            evidence = [
+                {
+                    "evidence_id": f"e{index:04d}",
+                    "kind": "boundary",
+                    "command": "c" * 2048,
+                    "observed": "o" * 2048,
+                    "result": "fail",
+                    "output_ref": "output.txt",
+                }
+                for index in range(32)
+            ]
+            state = {
+                "loop": {
+                    "attempt_history": [
+                        {
+                            "attempt_id": "a0001",
+                            "plan_revision": 1,
+                            "kind": "implement",
+                            "hypothesis": "h" * 512,
+                            "outcome": "fail",
+                            "result": "fail",
+                            "closure_reason": "c" * 512,
+                            "evidence_snapshot": evidence,
+                            "review_snapshot": None,
+                            "diagnosis": {
+                                "classification": "implementation",
+                                "cause_summary": "the same boundary failed",
+                                "next_action_summary": "make a bounded correction",
+                                "source_refs": ["e0001"],
+                            },
+                        }
+                    ]
+                }
+            }
+            projection = guard.context_history(state, 3)
+            self.assertLess(len(json.dumps(projection, ensure_ascii=False).encode("utf-8")), 12000)
+            item = projection["items"][0]
+            self.assertNotIn("evidence_snapshot", item)
+            self.assertNotIn("command", item)
+            self.assertNotIn("observed", item)
+            self.assertEqual(item["evidence_refs"], [f"e{index:04d}" for index in range(8)])
+            self.assertEqual(item["failure_classification"], "implementation")
+            self.assertEqual(item["next_change"], "make a bounded correction")
+        finally:
+            sys.path.pop(0)
+
+    def test_progress_text_includes_risk_details_and_gaps(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _, _, state_path = self.init_run(Path(temp_dir))
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["risk"]["details"] = ["宿主环境仍未核验"]
+            state["gaps"] = ["需要真实宿主收据"]
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            result = self.run_guard("progress", "--state", str(state_path), "--format", "text")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("risk.details=宿主环境仍未核验", result.stdout)
+            self.assertIn("gaps=需要真实宿主收据", result.stdout)
+
+    def test_plan_skill_defines_distinct_fast_and_full_expansions(self):
+        content = (ROOT / "skills" / "coding-rules-plan" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("FAST 展开", content)
+        self.assertIn("FULL 展开", content)
+        self.assertIn("七节骨架", content)
+
+    def test_guard_entrypoint_uses_split_guardlib_modules(self):
+        package = ROOT / "scripts" / "guardlib"
+        self.assertTrue((package / "__init__.py").is_file())
+        self.assertTrue((package / "verification.py").is_file())
+        self.assertTrue((package / "projections.py").is_file())
+        entrypoint = (ROOT / "scripts" / "guard.py").read_text(encoding="utf-8")
+        self.assertIn("from guardlib.guard import main", entrypoint)
 
     def test_retry_verify_requires_new_external_observation_and_archives_attempt(self):
         with tempfile.TemporaryDirectory() as temp_dir:

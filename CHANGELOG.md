@@ -6,6 +6,8 @@
 - Add source-bound diagnosis, bounded `rework`, `revise-plan`, and environment-only `retry-verify` lifecycle gates; failed, blocked, superseded, and completed attempts are archived without making historical evidence current.
 - Add deterministic read-only `context`/`progress`, short `set-activity`, bounded telemetry events, and display-line output. Progress does not run Git/tests/models, create percentages/ETAs, or change release gates.
 - Add optional Plan-bound verification definitions, execution/input bindings, idempotent execution registration, and read-only `check-verification` decisions (`reuse`, `run`, `diagnose`, `unknown`, `blocked`). Only trusted host/adapter receipts can be reused; this release has no host execution-interception API.
+- Harden verification reuse: require stable before/after/current input bindings, support only explicit `once` or bounded multi-sample policies, diagnose matching failures before `--force`, and allow one execution to back multiple distinct evidence assertions.
+- Compact historical context projections, include risk details and gaps in text progress, document distinct FAST/FULL Plan expansions, correct file-backed JSON examples, and split the CLI entrypoint into `scripts/guardlib` modules.
 - Complete G-01/G-02/G-03 Git hardening: porcelain-v1 NUL status parsing, conflict/stage rejection, index/tree/content/type/mode identities, unsupported object errors, scoped command-local snapshots, and post-commit residual checks.
 - Keep the original Plan/evidence/review/delivery gates, atomic state save, non-overwriting `init`, content-index baseline marker, and active `revise-plan --reason` behavior. The optional G-11 graph projection is intentionally not implemented.
 

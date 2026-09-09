@@ -57,7 +57,7 @@ FULL 仍使用同一份七节骨架，但必须展开跨层契约、宿主或发
 
 七节骨架的标题和顺序不变；FAST/FULL 的区别体现在每节的事实密度和边界覆盖，不新增第八节。
 
-将该卡片作为 Plan Markdown 的完整初始内容，通过 `guard.py write-plan --file <PLAN_FILE> --content-file <CARD_FILE>` 或 `--stdin` 直接写入。`PLAN_FILE` 必须是任务工作目录中的显式路径（例如 `work/plan.md`），不得自动写到业务仓库或暂存。聊天只返回该 Markdown 文件链接，不重复卡片内容，也不创建报告或总结文档。Implement 创建运行状态时必须把同一路径传给 `guard.py init --plan-file <PLAN_FILE>`；完成门禁通过后会自动删除它。7 个小节结束即停止；不得在 `RISK` 后追加执行说明、分支、委派或后续步骤；运行状态由 Implement 在真正写入前创建。
+将该卡片作为 Plan Markdown 的完整初始内容，通过 `guard.py write-plan --file <PLAN_FILE> --content-file <CARD_FILE>` 或 `--stdin` 直接写入。`PLAN_FILE` 必须是任务工作目录中的显式路径（例如 `work/plan.md`），不得自动写到业务仓库或暂存。聊天主要返回该 Markdown 文件链接，不重复卡片内容，也不创建报告或总结文档；关键阶段变化、阻塞或结束可额外展示一次 `display_line` 或 `progress` 事实进度，但禁止流水账、百分比和 ETA。Implement 创建运行状态时必须把同一路径传给 `guard.py init --plan-file <PLAN_FILE>`；完成门禁通过后会自动删除它。7 个小节结束即停止；不得在 `RISK` 后追加执行说明、分支、委派或后续步骤；运行状态由 Implement 在真正写入前创建。
 
 收到新需求时，必须复用同一 `PLAN_FILE`，先用 `guard.py prepend-requirement --file <PLAN_FILE> --content-file <REQUIREMENT_FILE>` 将需求原样添加到现有 Markdown 顶部；不得覆盖旧 Plan、另建脱节的第二份 Plan 或只在聊天中说明。新需求若改变 MODE、GOAL、WRITE、VERIFY 或 RISK，随后重新调用 planner，并按现有 replan/record-plan 门禁更新运行状态。
 

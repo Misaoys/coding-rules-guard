@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
-from .projections import compact_context_history, progress_text_lines
+from .projections import compact_attempt, compact_context_history, progress_text_lines
 from .verification import (
     execution_binding_reason as _execution_binding_reason,
     execution_sample_ids as _execution_sample_ids,
@@ -2276,7 +2276,13 @@ def normalize_execution_record(
         normalized["runner"] = bounded_text(raw["runner"], "execution.runner", 128)
         if binding and normalized["runner"] != binding["summary"].get("runner"):
             raise GateError("EXECUTION_RECORD_INVALID", ["execution.runner does not match the registered command"])
-    if raw.get("sample_id") is not None:
+    repeat_policy = binding["summary"].get("repeat_policy", {}) if binding else {}
+    if repeat_policy.get("mode") == "samples":
+        sample_id = raw.get("sample_id")
+        if not isinstance(sample_id, str) or not sample_id.strip():
+            raise GateError("EXECUTION_RECORD_INVALID", ["execution.sample_id is required for repeat_policy.samples"])
+        normalized["sample_id"] = bounded_text(sample_id, "execution.sample_id", 128)
+    elif raw.get("sample_id") is not None:
         normalized["sample_id"] = bounded_text(raw["sample_id"], "execution.sample_id", 128)
     return normalized
 
@@ -2453,26 +2459,38 @@ def command_check_verification(args: argparse.Namespace) -> None:
         if repeat_policy["mode"] == "samples":
             stable_executions = [evidence_execution(state, item) for item in stable]
             sample_ids, missing_sample_id = execution_sample_ids(stable_executions)
-            if missing_sample_id:
-                base.update(
-                    {
-                        "decision": "run",
-                        "reason_codes": ["REPEAT_SAMPLE_ID_REQUIRED", "REPEAT_SAMPLES_INSUFFICIENT"],
-                        "samples_observed": len(sample_ids),
-                        "samples_required": repeat_policy["required_samples"],
-                    }
-                )
-                emit(base)
             if len(sample_ids) < repeat_policy["required_samples"]:
+                reason_codes = ["REPEAT_SAMPLES_INSUFFICIENT"]
+                if missing_sample_id:
+                    reason_codes.insert(0, "REPEAT_SAMPLE_ID_REQUIRED")
                 base.update(
                     {
                         "decision": "run",
-                        "reason_codes": ["REPEAT_SAMPLES_INSUFFICIENT"],
+                        "reason_codes": reason_codes,
                         "samples_observed": len(sample_ids),
                         "samples_required": repeat_policy["required_samples"],
                     }
                 )
                 emit(base)
+            reusable = [
+                item
+                for item in stable
+                if isinstance(evidence_execution(state, item).get("sample_id"), str)
+                and evidence_execution(state, item).get("sample_id").strip()
+            ]
+            reason_codes = ["MATCHING_ACTIVE_EXECUTION"]
+            if missing_sample_id:
+                reason_codes.append("REPEAT_SAMPLE_ID_INCOMPLETE_IGNORED")
+            base.update(
+                {
+                    "decision": "reuse",
+                    "reason_codes": reason_codes,
+                    "source_evidence_id": reusable[-1].get("evidence_id") if reusable else stable[-1].get("evidence_id"),
+                    "samples_observed": len(sample_ids),
+                    "samples_required": repeat_policy["required_samples"],
+                }
+            )
+            emit(base)
         base.update({"decision": "reuse", "reason_codes": ["MATCHING_ACTIVE_EXECUTION"], "source_evidence_id": stable[-1].get("evidence_id")})
         emit(base)
         base.update({"decision": "reuse", "reason_codes": ["MATCHING_ACTIVE_EXECUTION"], "source_evidence_id": trusted[-1].get("evidence_id")})
@@ -2510,7 +2528,11 @@ def command_progress(args: argparse.Namespace) -> None:
             else "pending"
         ),
         "attempt": {
-            "active": copy.deepcopy(state.get("loop", {}).get("active_attempt")),
+            "active": compact_attempt(
+                state.get("loop", {}).get("active_attempt"),
+                MAX_CONTEXT_EVIDENCE_REFS,
+                MAX_CONTEXT_TEXT_CHARS,
+            ),
             "started": state.get("loop", {}).get("attempt_count", 0),
             "max": state.get("loop", {}).get("policy", {}).get("max_attempts"),
         },
@@ -2585,7 +2607,7 @@ def command_context(args: argparse.Namespace) -> None:
         "plan": {"path": state.get("plan_file"), "revision": state.get("plan_revision"), "recorded": isinstance(state.get("plan_record"), dict)},
         "write_scope": write_scope,
         "changed_files": changed_files,
-        "active_attempt": copy.deepcopy(active),
+        "active_attempt": compact_attempt(active, MAX_CONTEXT_EVIDENCE_REFS, MAX_CONTEXT_TEXT_CHARS),
         "unresolved": {"risk": copy.deepcopy(state.get("risk", {})), "gaps": list(state.get("gaps", [])), "result": state.get("result")},
         "history": context_history(state, args.history_limit),
         "budget": copy.deepcopy(state.get("loop", {}).get("policy", {})) | {
@@ -2892,6 +2914,17 @@ def diagnosis_source_snapshot(
     return snapshot, sha256_json(snapshot)
 
 
+def ensure_diagnosis_current(
+    state: dict[str, Any], diagnosis: dict[str, Any], snapshot: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    current_snapshot, current_snapshot_digest = diagnosis_source_snapshot(state, snapshot)
+    if diagnosis.get("source_snapshot_digest") != current_snapshot_digest:
+        raise GateError("DIAGNOSIS_STALE", ["evidence, review, result, gaps, or inputs changed after diagnosis"])
+    if diagnosis.get("worktree_fingerprint") != current_snapshot.get("worktree_fingerprint"):
+        raise GateError("DIAGNOSIS_STALE", ["diagnosis no longer matches the current worktree"])
+    return current_snapshot
+
+
 def normalized_diagnosis(
     state: dict[str, Any], raw: Any, snapshot: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -3011,13 +3044,11 @@ def command_retry_verify(args: argparse.Namespace) -> None:
     if args.observation is not None:
         bounded_text(args.observation, "observation", MAX_OBSERVED_CHARS)
     try:
-        current_snapshot, current_snapshot_digest = diagnosis_source_snapshot(state, snapshot)
+        current_snapshot = ensure_diagnosis_current(state, diagnosis, snapshot)
     except GateError as exc:
+        if exc.code == "DIAGNOSIS_STALE":
+            raise
         raise GateError("RETRY_VERIFY_BLOCKED", exc.details) from exc
-    if diagnosis.get("source_snapshot_digest") != current_snapshot_digest:
-        raise GateError("DIAGNOSIS_STALE", ["evidence, review, result, gaps, or inputs changed after diagnosis"])
-    if diagnosis.get("worktree_fingerprint") != current_snapshot.get("worktree_fingerprint"):
-        raise GateError("DIAGNOSIS_STALE", ["diagnosis no longer matches the current worktree"])
     plan_errors = ensure_plan_record(state) + ensure_executor_profile(state)
     if plan_errors:
         raise GateError("RETRY_VERIFY_BLOCKED", plan_errors)
@@ -3060,6 +3091,11 @@ def command_rework(args: argparse.Namespace) -> None:
     diagnosis = active.get("diagnosis")
     if not isinstance(diagnosis, dict):
         raise GateError("DIAGNOSIS_REQUIRED", ["record a current diagnosis before rework"])
+    classification = diagnosis.get("classification")
+    if classification == "hypothesis_or_scope":
+        raise GateError("REWORK_NOT_ALLOWED", ["hypothesis_or_scope diagnosis requires revise-plan"])
+    if classification in {"environment", "input_data"}:
+        raise GateError("REWORK_NOT_ALLOWED", [f"{classification} diagnosis requires retry-verify"])
     plan_errors = ensure_plan_record(state) + ensure_executor_profile(state)
     if plan_errors:
         raise GateError("REWORK_BLOCKED", plan_errors)
@@ -3067,9 +3103,8 @@ def command_rework(args: argparse.Namespace) -> None:
         ensure_current_scope(state, snapshot=snapshot)
     except GateError as exc:
         raise GateError("REWORK_BLOCKED", exc.details) from exc
-    current_fingerprint = compute_evidence_fingerprint(state, snapshot)
-    if diagnosis.get("worktree_fingerprint") != current_fingerprint:
-        raise GateError("DIAGNOSIS_STALE", ["diagnosis no longer matches the current evidence binding"])
+    ensure_diagnosis_current(state, diagnosis, snapshot)
+    next_hypothesis = diagnosis.get("next_hypothesis") or state["goal"]
     no_new_information = bool(failure_signatures(state) & historical_failure_signatures(state))
     if state["rework_streak"] + 1 < REWORK_REPLAN_AT:
         ensure_attempt_budget(state)
@@ -3095,7 +3130,7 @@ def command_rework(args: argparse.Namespace) -> None:
     else:
         state["phase"] = "implement"
         state["replan_required"] = False
-        start_attempt(state, "implement", state["goal"], archived["attempt_id"], snapshot)
+        start_attempt(state, "implement", next_hypothesis, archived["attempt_id"], snapshot)
         if state["rework_streak"] >= REWORK_WARN_AT:
             payload["warning"] = "REPLAN_RECOMMENDED"
     if no_new_information:

@@ -240,6 +240,75 @@ class GuardV5Tests(unittest.TestCase):
             self.assertEqual(len(state["loop"]["attempt_history"]), 1)
             self.assertEqual(state["loop"]["attempt_history"][0]["outcome"], "fail")
             self.assertEqual(state["evidence"], [])
+            self.assertEqual(
+                state["loop"]["active_attempt"]["hypothesis"],
+                diagnosis["next_hypothesis"],
+            )
+
+    def test_rework_rejects_diagnosis_after_new_evidence_changes_source_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _, _, state_path = self.start_verify(Path(temp_dir))
+            for command in (
+                (
+                    "record-evidence", "--state", str(state_path), "--kind", "boundary", "--entry", "failure",
+                    "--command", "python -m unittest", "--observed", "failed", "--level", "test", "--result", "fail",
+                ),
+                ("set-result", "--state", str(state_path), "--result", "fail"),
+            ):
+                result = self.run_guard(*command)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            diagnosis = {
+                "classification": "implementation",
+                "cause_summary": "the boundary behavior is wrong",
+                "source_refs": ["e0001"],
+                "next_action_summary": "fix the guarded path",
+                "next_hypothesis": "the corrected path will pass",
+                "expected_observation": "the boundary passes",
+                "new_information": {"kind": "code_change_planned", "summary": "a fix is planned", "source_refs": ["e0001"]},
+            }
+            result = self.run_guard("record-diagnosis", "--state", str(state_path), "--input", json.dumps(diagnosis))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            result = self.run_guard(
+                "record-evidence", "--state", str(state_path), "--kind", "boundary", "--entry", "new-failure",
+                "--command", "python -m unittest", "--observed", "a newer failure", "--level", "test", "--result", "fail",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            before = state_path.read_bytes()
+            result = self.run_guard("rework", "--state", str(state_path), "--reason", "stale diagnosis")
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "DIAGNOSIS_STALE")
+            self.assertEqual(state_path.read_bytes(), before)
+
+    def test_rework_requires_replan_for_hypothesis_or_scope_diagnosis(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _, _, state_path = self.start_verify(Path(temp_dir))
+            for command in (
+                (
+                    "record-evidence", "--state", str(state_path), "--kind", "boundary", "--entry", "failure",
+                    "--command", "python -m unittest", "--observed", "failed", "--level", "test", "--result", "fail",
+                ),
+                ("set-result", "--state", str(state_path), "--result", "fail"),
+            ):
+                result = self.run_guard(*command)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            diagnosis = {
+                "classification": "hypothesis_or_scope",
+                "cause_summary": "the expected behavior changed",
+                "source_refs": ["e0001"],
+                "next_action_summary": "replan the task",
+                "next_hypothesis": "the revised plan will satisfy the new scope",
+                "expected_observation": "the revised acceptance path passes",
+                "new_information": {"kind": "contract_correction", "summary": "scope changed", "source_refs": ["e0001"]},
+            }
+            result = self.run_guard("record-diagnosis", "--state", str(state_path), "--input", json.dumps(diagnosis))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            before = state_path.read_bytes()
+            result = self.run_guard("rework", "--state", str(state_path), "--reason", "scope changed")
+            self.assertEqual(result.returncode, 2)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["code"], "REWORK_NOT_ALLOWED")
+            self.assertIn("revise-plan", " ".join(payload["details"]))
+            self.assertEqual(state_path.read_bytes(), before)
 
     def test_attempt_budget_rejects_rework_without_mutating_failed_state(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -503,6 +572,105 @@ class GuardV5Tests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(json.loads(result.stdout)["decision"], "reuse")
 
+    def test_sample_repeat_registration_requires_sample_id(self):
+        spec = {
+            "definitions": [
+                {
+                    "check_id": "unit",
+                    "claim_ids": ["claim.unit"],
+                    "criterion_digest": "criterion-v1",
+                    "command_spec": {"argv": ["python", "-m", "unittest"], "cwd": "repo", "runner": "local"},
+                    "input_spec": {"paths": ["src/a.py"], "dependency_coverage": "declared"},
+                    "repeat_policy": {"mode": "samples", "required_samples": 2},
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo, _, state_path = self.start_verify(Path(temp_dir), spec)
+            sys.path.insert(0, str(ROOT / "scripts"))
+            try:
+                import guard
+
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                definition = guard.verification_definition(state, "unit")
+                digest = guard.verification_input_binding(state, definition, {})["digest"]
+            finally:
+                sys.path.pop(0)
+            execution = {
+                "execution_id": "x-missing-sample",
+                "source": "host_receipt",
+                "argv": ["python", "-m", "unittest"],
+                "cwd": str(repo),
+                "result": "pass",
+                "before_binding": {"binding_digest": digest},
+                "after_binding": {"binding_digest": digest},
+            }
+            result = self.run_guard(
+                "record-evidence", "--state", str(state_path), "--kind", "success", "--entry", "unit",
+                "--command", "python -m unittest", "--observed", "passed", "--level", "test", "--result", "pass",
+                "--check-id", "unit", "--execution-record", json.dumps(execution),
+            )
+            self.assertEqual(result.returncode, 2)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["code"], "EXECUTION_RECORD_INVALID")
+            self.assertIn("sample_id", " ".join(payload["details"]))
+
+    def test_repeat_policy_ignores_legacy_missing_sample_id_when_named_samples_are_sufficient(self):
+        spec = {
+            "definitions": [
+                {
+                    "check_id": "unit",
+                    "claim_ids": ["claim.unit"],
+                    "criterion_digest": "criterion-v1",
+                    "command_spec": {"argv": ["python", "-m", "unittest"], "cwd": "repo", "runner": "local"},
+                    "input_spec": {"paths": ["src/a.py"], "dependency_coverage": "declared"},
+                    "repeat_policy": {"mode": "samples", "required_samples": 2},
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo, _, state_path = self.start_verify(Path(temp_dir), spec)
+            sys.path.insert(0, str(ROOT / "scripts"))
+            try:
+                import guard
+
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                definition = guard.verification_definition(state, "unit")
+                digest = guard.verification_input_binding(state, definition, {})["digest"]
+            finally:
+                sys.path.pop(0)
+
+            def record(sample_id, execution_id):
+                execution = {
+                    "execution_id": execution_id,
+                    "sample_id": sample_id,
+                    "source": "host_receipt",
+                    "argv": ["python", "-m", "unittest"],
+                    "cwd": str(repo),
+                    "result": "pass",
+                    "before_binding": {"binding_digest": digest},
+                    "after_binding": {"binding_digest": digest},
+                }
+                result = self.run_guard(
+                    "record-evidence", "--state", str(state_path), "--kind", "success", "--entry", sample_id,
+                    "--command", "python -m unittest", "--observed", "passed", "--level", "test", "--result", "pass",
+                    "--check-id", "unit", "--execution-record", json.dumps(execution),
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            record("sample-1", "x-sample-1")
+            record("sample-2", "x-sample-2")
+            record("sample-3", "x-sample-3")
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["evidence"][2]["execution"].pop("sample_id")
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            result = self.run_guard("check-verification", "--state", str(state_path), "--check-id", "unit")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["decision"], "reuse")
+            self.assertEqual(payload["samples_observed"], 2)
+            self.assertEqual(payload["samples_required"], 2)
+
     def test_force_does_not_bypass_matching_failure(self):
         spec = {
             "definitions": [
@@ -652,11 +820,78 @@ class GuardV5Tests(unittest.TestCase):
             self.assertNotIn("evidence_snapshot", item)
             self.assertNotIn("command", item)
             self.assertNotIn("observed", item)
-            self.assertEqual(item["evidence_refs"], [f"e{index:04d}" for index in range(8)])
+            self.assertEqual(
+                item["evidence_refs"],
+                ["e0001", "e0000", "e0002", "e0003", "e0004", "e0005", "e0006", "e0007"],
+            )
             self.assertEqual(item["failure_classification"], "implementation")
             self.assertEqual(item["next_change"], "make a bounded correction")
         finally:
             sys.path.pop(0)
+
+    def test_context_history_prioritizes_diagnosis_and_failures_and_reads_nested_output_ref(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        try:
+            import guard
+
+            evidence = []
+            for index in range(1, 10):
+                result = "fail" if index == 9 else "pass"
+                evidence.append(
+                    {
+                        "evidence_id": f"e{index:04d}",
+                        "kind": "boundary",
+                        "entry": f"entry-{index}",
+                        "command": "test",
+                        "observed": "critical failure" if result == "fail" else "passed",
+                        "result": result,
+                        "output_ref": "wrong-top-level.log",
+                        "execution": {"output_ref": f"nested-{index}.log"},
+                    }
+                )
+            state = {
+                "loop": {
+                    "attempt_history": [
+                        {
+                            "attempt_id": "a0001",
+                            "plan_revision": 1,
+                            "kind": "implement",
+                            "hypothesis": "bounded hypothesis",
+                            "outcome": "fail",
+                            "result": "fail",
+                            "closure_reason": "failed",
+                            "evidence_snapshot": evidence,
+                            "review_snapshot": None,
+                            "diagnosis": {
+                                "classification": "implementation",
+                                "cause_summary": "the critical boundary failed",
+                                "next_action_summary": "make a bounded correction",
+                                "source_refs": ["e0009"],
+                            },
+                        }
+                    ]
+                }
+            }
+            projection = guard.context_history(state, 3)
+            item = projection["items"][0]
+            self.assertEqual(item["evidence_refs"][0], "e0009")
+            self.assertIn("e0009: fail; critical failure", item["key_conclusions"])
+            self.assertEqual(item["record_locations"][0], "nested-9.log")
+            self.assertNotIn("wrong-top-level.log", item["record_locations"])
+        finally:
+            sys.path.pop(0)
+
+    def test_context_projects_active_attempt_fields(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _, _, state_path = self.start_verify(Path(temp_dir))
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["loop"]["active_attempt"]["unbounded_internal_trace"] = "trace" * 10000
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            result = self.run_guard("context", "--state", str(state_path), "--history-limit", "3", "--path-limit", "20")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            context = json.loads(result.stdout)
+            self.assertNotIn("unbounded_internal_trace", context["active_attempt"])
+            self.assertEqual(context["active_attempt"]["hypothesis"], "the change is bounded")
 
     def test_progress_text_includes_risk_details_and_gaps(self):
         with tempfile.TemporaryDirectory() as temp_dir:

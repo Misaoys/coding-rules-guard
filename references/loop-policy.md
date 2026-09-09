@@ -5,7 +5,7 @@
 ## 路由
 
 1. 记录当前 attempt 的真实 evidence／review 和结果。
-2. 实现缺陷、验证契约问题或未知失败：写入当前诊断；能在原 Plan、WRITE 和验证条件内修复时调用 `rework`。
+2. 实现缺陷、验证契约问题或未知失败：写入当前诊断；能在原 Plan、WRITE 和验证条件内修复时调用 `rework`。假设／范围变化必须调用 `revise-plan`；环境／输入阻塞只能走 `retry-verify`。
 3. 需求、范围、验收或关键假设变化：调用 `revise-plan --reason`，递增 Plan revision，重新 `record-plan`；不要只换 hypothesis 文字。
 4. 环境／外部输入阻塞：保留 blocked 结果，取得新的外部观察并在当前 attempt 记录环境诊断后调用 `retry-verify`。该命令不运行测试、不改代码、不写 pass。
 5. 无新信息、预算耗尽或来源不可核对：停止自动继续，保留当前 state 和缺口，等待用户／宿主决定。
@@ -20,4 +20,4 @@
 
 ## 诊断边界
 
-诊断是模型声明的路由输入，不是根因证明、授权或通过记录。来源 ID 必须属于当前活动 attempt；来源快照、Plan revision、工作区指纹和结果变化会使诊断过期。相同失败可能返回 `NO_NEW_INFORMATION` 提醒，但全局预算和原有失败处置才是停止机制。
+诊断是模型声明的路由输入，不是根因证明、授权或通过记录。来源 ID 必须属于当前活动 attempt；来源快照、Plan revision、工作区指纹和结果变化会使诊断过期。`rework` 在归档、清空证据和开启下一轮前重新比较来源摘要；发现新证据或结果变化返回 `DIAGNOSIS_STALE`。实现／验证契约／未知诊断可在原 Plan 内返工；假设／范围诊断必须重规划，环境／输入诊断必须等待新的外部观察后 `retry-verify`。相同失败可能返回 `NO_NEW_INFORMATION` 提醒，但全局预算和原有失败处置才是停止机制。

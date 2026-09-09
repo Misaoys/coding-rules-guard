@@ -6,7 +6,7 @@
 
 `record-plan --verification-spec` 只接收与当前 Plan VERIFY 对应的机器化子集：`check_id`、claim IDs、criterion digest、有序 argv/cwd/runner、输入路径／依赖覆盖、环境或外部状态身份和 repeat policy。定义摘要进入 Plan 指纹；Verify 阶段不能偷偷缩窄或替换定义。
 
-`record-evidence --check-id <ID> --execution-record <JSON>` 登记真实 execution。执行来源分为 `host_receipt`、`adapter` 和 `agent_report`；后者保持自报性质。可用的 `repeat_policy` 只有 `{"mode":"once"}` 和 `{"mode":"samples","required_samples":2..16}`；多次采样必须为每个 execution 提供不同的 `sample_id`。
+`record-evidence --check-id <ID> --execution-record <JSON>` 登记真实 execution。执行来源分为 `host_receipt`、`adapter` 和 `agent_report`；后者保持自报性质。可用的 `repeat_policy` 只有 `{"mode":"once"}` 和 `{"mode":"samples","required_samples":2..16}`；多次采样的每个新 execution 都必须提供非空 `sample_id`，并以不同 ID 计数。旧状态可能有缺少 ID 的记录；查询时这些记录不计入样本数量，但在已具备足够命名样本时不会把查询永久卡在 `run`，而会明确返回不完整记录提示。
 
 需要参与自动复用的 execution 必须提供受支持的输入观察格式：`before_binding` 与 `after_binding` 都是 `{ "binding_digest": "<64 位小写 SHA-256>" }`。两者必须相同，并且同时等于查询时重新得到的当前绑定；缺失、不一致或过期只能返回 `unknown`，不能补算成当前输入。定义中声明的 environment／external state 还需要适配器提供当前观察；固定在 Plan 里的旧身份不等于当前环境已核验。
 

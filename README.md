@@ -15,7 +15,7 @@ Coding Rules Guard is a Codex plugin for risk-routed coding work. It keeps low-r
 - Content-index Git fingerprints with NUL-safe path parsing, bounded argument batches, and an explicit legacy slow path marker.
 - Evidence fingerprints tied to the current task worktree, plus active `revise-plan --reason` support in Plan, Implement, and Verify.
 - Separate, audited gap authorization with machine-generated time and external actor identity.
-- A guarded `rework` loop that returns failed verification to implementation and invalidates stale evidence.
+- A guarded `rework` loop that returns confirmed implementation failures to implementation, rejects stale diagnoses, and invalidates stale evidence.
 - Source-bound `record-diagnosis`, `retry-verify`, and `revise-plan` lifecycle gates; old attempts remain historical and cannot satisfy a new attempt.
 - Optional verification definitions and conservative `check-verification` reuse queries; the CLI does not execute saved commands or pretend to intercept a host executor.
 - No default or repeated hash checks; hash parity runs once only when artifact identity is an acceptance criterion.
@@ -156,7 +156,7 @@ python scripts/guard.py set-result --state .\work\run-state.json --result fail
 python scripts/guard.py rework --state .\work\run-state.json --reason "implementation defect confirmed"
 ```
 
-Before `rework`, the current attempt must contain a bounded diagnosis that cites current failed evidence or a failed review. The diagnosis is a routing record, not authorization or proof of a root cause:
+Before `rework`, the current attempt must contain a bounded, current diagnosis that cites failed evidence or a failed review. The source snapshot is checked again immediately before the attempt is archived; new evidence or a changed result returns `DIAGNOSIS_STALE` without clearing state. Only an `implementation`, `verification_contract`, or `unknown` diagnosis can use `rework`; `hypothesis_or_scope` requires `revise-plan`, and environment/input diagnoses use `retry-verify`. The next attempt receives the diagnosis's `next_hypothesis`, not the broad task goal. The diagnosis is a routing record, not authorization or proof of a root cause:
 
 ```powershell
 python scripts/guard.py record-diagnosis `
@@ -228,7 +228,7 @@ python scripts/guard.py check-verification --state .\work\run-state.json --check
 
 The result is only `reuse`, `run`, `diagnose`, `unknown`, or `blocked`. Reuse preserves the original evidence/execution ID and is limited to the same attempt, Plan, definition, complete input binding, and trusted `host_receipt`/`adapter` source. `agent_report` never earns automatic reuse. A `--force` reason only requests a fresh run; it cannot override an unresolved failure, unknown dependency coverage, or an unavailable current environment/external-state observation. This CLI has no host-level execution-interception API, so the actual adapter or Skill must consume the query; no command is automatically skipped merely because a query returned `reuse`.
 
-The supported repeat policies are `{"mode":"once"}` and `{"mode":"samples","required_samples":2..16}`. Sample runs need distinct `sample_id` values. A reusable execution record must include matching `before_binding` and `after_binding` objects of the form `{ "binding_digest": "<64 lowercase hex characters>" }`; the query also compares that digest with the current input binding. Missing or changed observations return `unknown`, and a static Plan environment identity is not a current environment observation. One execution may support multiple evidence assertions; only the same assertion is idempotent. An unresolved matching failure is diagnosed before `--force` is honored.
+The supported repeat policies are `{"mode":"once"}` and `{"mode":"samples","required_samples":2..16}`. Sample runs need a non-empty `sample_id` on every newly registered execution, and distinct IDs are counted toward the requirement. If an older state contains an incomplete execution, it is excluded from the sample count; once enough named samples exist, the query may return `reuse` with an explicit incomplete-record notice instead of repeatedly requesting another run. A reusable execution record must include matching `before_binding` and `after_binding` objects of the form `{ "binding_digest": "<64 lowercase hex characters>" }`; the query also compares that digest with the current input binding. Missing or changed observations return `unknown`, and a static Plan environment identity is not a current environment observation. One execution may support multiple evidence assertions; only the same assertion is idempotent. An unresolved matching failure is diagnosed before `--force` is honored.
 
 ## Evidence boundary
 

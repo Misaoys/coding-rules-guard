@@ -9,6 +9,8 @@
 - Harden verification reuse: require stable before/after/current input bindings, support only explicit `once` or bounded multi-sample policies, diagnose matching failures before `--force`, and allow one execution to back multiple distinct evidence assertions.
 - Compact historical context projections, include risk details and gaps in text progress, document distinct FAST/FULL Plan expansions, correct file-backed JSON examples, and split the CLI entrypoint into `scripts/guardlib` modules.
 - Complete G-01/G-02/G-03 Git hardening: porcelain-v1 NUL status parsing, conflict/stage rejection, index/tree/content/type/mode identities, unsupported object errors, scoped command-local snapshots, and post-commit residual checks.
+- Tighten V2.2 boundary handling: malformed explicit execution timestamps are rejected, `--force` cannot override unavailable environment observations, progress text escapes untrusted control characters and exposes Review failures, and v5 verification registry references are checked against their evidence records at load time.
+- Make the Deliver Skill consume `check-verification` before repeating registered checks, while preserving independent Review, live Git, authorization, and completion gates.
 - Keep the original Plan/evidence/review/delivery gates, atomic state save, non-overwriting `init`, content-index baseline marker, and active `revise-plan --reason` behavior. The optional G-11 graph projection is intentionally not implemented.
 
 ## 0.13.0 - 2026-09-09

@@ -773,6 +773,180 @@ class GuardV5Tests(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
             self.assertIn("UNREVIEWED_RESIDUAL_CHANGES", result.stdout)
 
+    def test_force_cannot_bypass_current_environment_unknown(self):
+        spec = {
+            "definitions": [
+                {
+                    "check_id": "hosted-unit",
+                    "claim_ids": ["claim.unit"],
+                    "criterion_digest": "criterion-v1",
+                    "command_spec": {"argv": ["python", "-m", "unittest"], "cwd": "repo", "runner": "local"},
+                    "input_spec": {
+                        "paths": ["src/a.py"],
+                        "dependency_coverage": "declared",
+                        "environment": {"host": "installed-runtime"},
+                    },
+                    "repeat_policy": {"mode": "once"},
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo, _, state_path = self.start_verify(root, spec)
+            sys.path.insert(0, str(ROOT / "scripts"))
+            try:
+                import guard
+
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                digest = guard.verification_input_binding(
+                    state, guard.verification_definition(state, "hosted-unit"), {}
+                )["digest"]
+            finally:
+                sys.path.pop(0)
+            execution = {
+                "execution_id": "x-hosted-unit",
+                "source": "host_receipt",
+                "argv": ["python", "-m", "unittest"],
+                "cwd": str(repo),
+                "result": "pass",
+                "before_binding": {"binding_digest": digest},
+                "after_binding": {"binding_digest": digest},
+            }
+            result = self.run_guard(
+                "record-evidence", "--state", str(state_path), "--kind", "success", "--entry", "hosted-unit",
+                "--command", "python -m unittest", "--observed", "passed", "--level", "host", "--result", "pass",
+                "--check-id", "hosted-unit", "--execution-record", json.dumps(execution),
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            result = self.run_guard(
+                "check-verification", "--state", str(state_path), "--check-id", "hosted-unit",
+                "--force", "--reason", "user requested a fresh hosted sample",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["decision"], "unknown")
+            self.assertIn("CURRENT_ENVIRONMENT_UNAVAILABLE", payload["reason_codes"])
+
+    def test_invalid_execution_timestamps_are_rejected_without_rewriting(self):
+        spec = {
+            "definitions": [
+                {
+                    "check_id": "unit",
+                    "claim_ids": ["claim.unit"],
+                    "criterion_digest": "criterion-v1",
+                    "command_spec": {"argv": ["python", "-m", "unittest"], "cwd": "repo", "runner": "local"},
+                    "input_spec": {"paths": ["src/a.py"], "dependency_coverage": "declared"},
+                    "repeat_policy": {"mode": "once"},
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo, _, state_path = self.start_verify(root, spec)
+            sys.path.insert(0, str(ROOT / "scripts"))
+            try:
+                import guard
+
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                digest = guard.verification_input_binding(
+                    state, guard.verification_definition(state, "unit"), {}
+                )["digest"]
+            finally:
+                sys.path.pop(0)
+            execution = {
+                "execution_id": "x-invalid-time",
+                "source": "host_receipt",
+                "argv": ["python", "-m", "unittest"],
+                "cwd": str(repo),
+                "started_at": "not-a-timestamp",
+                "finished_at": "also-not-a-timestamp",
+                "result": "pass",
+                "before_binding": {"binding_digest": digest},
+                "after_binding": {"binding_digest": digest},
+            }
+            before = state_path.read_bytes()
+            result = self.run_guard(
+                "record-evidence", "--state", str(state_path), "--kind", "success", "--entry", "unit",
+                "--command", "python -m unittest", "--observed", "passed", "--level", "test", "--result", "pass",
+                "--check-id", "unit", "--execution-record", json.dumps(execution),
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "EXECUTION_RECORD_INVALID")
+            self.assertEqual(state_path.read_bytes(), before)
+
+    def test_progress_text_escapes_control_characters(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _, _, state_path = self.init_run(Path(temp_dir))
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["risk"]["details"] = ["\x1b[31mred\nnext"]
+            state["gaps"] = ["\x1b[2Jclear-screen"]
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            result = self.run_guard("progress", "--state", str(state_path), "--format", "text")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("\x1b", result.stdout)
+            self.assertIn("\\u001b", result.stdout)
+
+    def test_progress_exposes_failed_review_result(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _, _, state_path = self.start_verify(Path(temp_dir))
+            for command in (
+                ("record-evidence", "--state", str(state_path), "--kind", "success", "--entry", "unit", "--command", "test", "--observed", "passed", "--level", "test", "--result", "pass"),
+                ("record-evidence", "--state", str(state_path), "--kind", "boundary", "--entry", "edge", "--command", "edge", "--observed", "passed", "--level", "test", "--result", "pass"),
+                ("set-result", "--state", str(state_path), "--result", "pass"),
+                ("record-review", "--state", str(state_path), "--result", "fail", "--observed", "review found a defect", "--profile", "session_main", "--model", "gpt-test-main", "--reasoning-effort", "high"),
+            ):
+                result = self.run_guard(*command)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            result = self.run_guard("progress", "--state", str(state_path), "--format", "text")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("review_result=fail", result.stdout)
+
+    def test_v5_state_rejects_missing_run_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _, _, state_path = self.init_run(Path(temp_dir))
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state.pop("run_id")
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            result = self.run_guard("status", "--state", str(state_path))
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "STATE_SCHEMA_INVALID")
+
+    def test_v5_state_rejects_registry_reference_with_wrong_evidence_check(self):
+        spec = {
+            "definitions": [
+                {
+                    "check_id": "unit",
+                    "claim_ids": ["claim.unit"],
+                    "criterion_digest": "criterion-unit",
+                    "command_spec": {"argv": ["python", "-m", "unittest"], "cwd": "repo", "runner": "local"},
+                    "input_spec": {"paths": ["src/a.py"], "dependency_coverage": "declared"},
+                    "repeat_policy": {"mode": "once"},
+                },
+                {
+                    "check_id": "edge",
+                    "claim_ids": ["claim.edge"],
+                    "criterion_digest": "criterion-edge",
+                    "command_spec": {"argv": ["python", "-m", "unittest", "edge"], "cwd": "repo", "runner": "local"},
+                    "input_spec": {"paths": ["src/a.py"], "dependency_coverage": "declared"},
+                    "repeat_policy": {"mode": "once"},
+                },
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _, _, state_path = self.start_verify(Path(temp_dir), spec)
+            result = self.run_guard(
+                "record-evidence", "--state", str(state_path), "--kind", "success", "--entry", "unit",
+                "--command", "python -m unittest", "--observed", "passed", "--level", "test", "--result", "pass",
+                "--check-id", "unit",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["verification_registry"]["active_refs"][0]["check_id"] = "edge"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            result = self.run_guard("status", "--state", str(state_path))
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(json.loads(result.stdout)["code"], "STATE_SCHEMA_INVALID")
+
 
 if __name__ == "__main__":
     unittest.main()

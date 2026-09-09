@@ -23,6 +23,7 @@ from .projections import compact_context_history, progress_text_lines
 from .verification import (
     execution_binding_reason as _execution_binding_reason,
     execution_sample_ids as _execution_sample_ids,
+    execution_timestamp as _execution_timestamp,
     normalize_execution_binding as _normalize_execution_binding,
     normalize_repeat_policy as _normalize_repeat_policy,
 )
@@ -850,7 +851,13 @@ def validate_v5_fields(state: dict[str, Any]) -> list[str]:
             item.get("check_id") for item in registry.get("definitions", []) if isinstance(item, dict)
         }
         seen_refs: set[tuple[Any, Any, Any]] = set()
-        current_ids = {item.get("evidence_id") for item in evidence if isinstance(item, dict)}
+        evidence_by_id = {
+            item.get("evidence_id"): item
+            for item in evidence
+            if isinstance(item, dict) and isinstance(item.get("evidence_id"), str)
+        }
+        current_ids = set(evidence_by_id)
+        indexed_evidence: set[tuple[Any, Any]] = set()
         for index, ref in enumerate(registry["active_refs"]):
             if not isinstance(ref, dict):
                 errors.append(f"verification_registry.active_refs[{index}] is invalid")
@@ -861,8 +868,26 @@ def validate_v5_fields(state: dict[str, Any]) -> list[str]:
             seen_refs.add(key)
             if ref.get("check_id") not in definition_ids or ref.get("evidence_id") not in current_ids:
                 errors.append(f"verification_registry.active_refs[{index}] references an unknown definition or evidence")
+                continue
+            evidence_item = evidence_by_id.get(ref.get("evidence_id"))
+            indexed_evidence.add((ref.get("check_id"), ref.get("evidence_id")))
+            if evidence_item.get("check_id") != ref.get("check_id"):
+                errors.append(f"verification_registry.active_refs[{index}] check_id does not match evidence")
+            if evidence_item.get("attempt_id") != ref.get("attempt_id"):
+                errors.append(f"verification_registry.active_refs[{index}] attempt_id does not match evidence")
+            execution = evidence_item.get("execution") if isinstance(evidence_item.get("execution"), dict) else None
+            execution_id = execution.get("execution_id") if execution else None
+            if ref.get("execution_id") != execution_id:
+                errors.append(f"verification_registry.active_refs[{index}] execution_id does not match evidence")
             if isinstance(active, dict) and ref.get("attempt_id") != active.get("attempt_id"):
                 errors.append(f"verification_registry.active_refs[{index}] is not bound to the active attempt")
+        for item in evidence if isinstance(evidence, list) else []:
+            if not isinstance(item, dict) or not item.get("check_id"):
+                continue
+            pair = (item.get("check_id"), item.get("evidence_id"))
+            if pair not in indexed_evidence:
+                errors.append("verification_registry.active_refs is missing a current checked evidence reference")
+                break
     return errors
 
 
@@ -875,6 +900,9 @@ def validate_shape(state: dict[str, Any]) -> None:
         errors.append("schema_version must be 1, 2, 3, 4, or 5")
     if state.get("mode") not in {"FAST", "FULL"}:
         errors.append("mode must be FAST or FULL")
+    run_id = state.get("run_id")
+    if not isinstance(run_id, str) or not run_id.strip():
+        errors.append("run_id must be a non-empty string")
     if state.get("phase") not in PHASES:
         errors.append("phase is invalid")
     if not str(state.get("goal", "")).strip():
@@ -2210,8 +2238,8 @@ def normalize_execution_record(
     normalized = {
         "execution_id": execution_id,
         "source": source,
-        "started_at": raw.get("started_at") if review_timestamp_is_valid(raw.get("started_at")) else utc_now(),
-        "finished_at": raw.get("finished_at") if review_timestamp_is_valid(raw.get("finished_at")) else utc_now(),
+        "started_at": _execution_timestamp(raw, "started_at", utc_now(), GateError),
+        "finished_at": _execution_timestamp(raw, "finished_at", utc_now(), GateError),
         "result": observed_result,
         "output_ref": output_ref,
         "check_id": check_id,
@@ -2343,6 +2371,9 @@ def command_check_verification(args: argparse.Namespace) -> None:
     except GateError as exc:
         base.update({"decision": "blocked", "reason_codes": ["LIVE_SCOPE_GATE", exc.code], "details": exc.details})
         emit(base)
+    force_reason = None
+    if args.force:
+        force_reason = bounded_text(args.reason, "reason", MAX_ATTEMPT_TEXT_CHARS)
     definition = verification_definition(state, args.check_id)
     if definition is None:
         base.update({"decision": "unknown", "reason_codes": ["CHECK_NOT_REGISTERED"]})
@@ -2372,23 +2403,21 @@ def command_check_verification(args: argparse.Namespace) -> None:
     if matching_failures:
         reason_codes = ["UNRESOLVED_FAILURE"]
         if args.force:
-            bounded_text(args.reason, "reason", MAX_ATTEMPT_TEXT_CHARS)
             reason_codes.append("FORCE_CANNOT_BYPASS_FAILURE")
-            base["force_reason"] = args.reason.strip()
+            base["force_reason"] = force_reason
         base.update({"decision": "diagnose", "reason_codes": reason_codes, "source_evidence_id": matching_failures[-1].get("evidence_id")})
         emit(base)
+    if binding["summary"].get("environment") or binding["summary"].get("external_state") is not None:
+        base.update({"decision": "unknown", "reason_codes": ["CURRENT_ENVIRONMENT_UNAVAILABLE"]})
+        emit(base)
     if args.force:
-        bounded_text(args.reason, "reason", MAX_ATTEMPT_TEXT_CHARS)
         base.update(
             {
                 "decision": "run",
                 "reason_codes": ["force", "FORCE_REQUESTED"],
-                "force_reason": args.reason.strip(),
+                "force_reason": force_reason,
             }
         )
-        emit(base)
-    if binding["summary"].get("environment") or binding["summary"].get("external_state") is not None:
-        base.update({"decision": "unknown", "reason_codes": ["CURRENT_ENVIRONMENT_UNAVAILABLE"]})
         emit(base)
     if matching_passes:
         trusted = [
@@ -2473,6 +2502,13 @@ def command_progress(args: argparse.Namespace) -> None:
             if isinstance(state.get("review"), dict)
             else "pending"
         ),
+        "review_result": (
+            state["review"].get("result")
+            if isinstance(state.get("review"), dict)
+            else "not_required"
+            if not state.get("review_required")
+            else "pending"
+        ),
         "attempt": {
             "active": copy.deepcopy(state.get("loop", {}).get("active_attempt")),
             "started": state.get("loop", {}).get("attempt_count", 0),
@@ -2493,10 +2529,6 @@ def command_progress(args: argparse.Namespace) -> None:
     }
     if args.format == "text":
         lines = progress_text_lines(state, projection)
-        if projection["activity"]:
-            lines.append(f"activity={projection['activity']['text']}")
-        for event in limited:
-            lines.append(f"event[{event['seq']}] {event['type']}: {event['summary']}")
         print("\n".join(lines))
         raise SystemExit(0)
     emit(projection)

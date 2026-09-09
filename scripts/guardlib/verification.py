@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Callable, Iterable
 
 
@@ -50,6 +51,22 @@ def execution_binding_reason(execution: dict[str, Any], current_digest: str) -> 
     if before_digest != current_digest or execution.get("binding_digest") != current_digest:
         return "EXECUTION_BINDING_STALE"
     return None
+
+
+def execution_timestamp(raw: dict[str, Any], field: str, now: str, error: ErrorFactory) -> str:
+    """Preserve explicit adapter timestamps; never turn malformed receipts into current facts."""
+    if field not in raw:
+        return now
+    value = raw[field]
+    if not isinstance(value, str) or not value.strip():
+        raise error("EXECUTION_RECORD_INVALID", [f"execution.{field} must be a timezone-aware timestamp"])
+    try:
+        timestamp = datetime.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise error("EXECUTION_RECORD_INVALID", [f"execution.{field} must be a timezone-aware timestamp"]) from exc
+    if timestamp.utcoffset() is None:
+        raise error("EXECUTION_RECORD_INVALID", [f"execution.{field} must be a timezone-aware timestamp"])
+    return value
 
 
 def execution_sample_ids(executions: Iterable[dict[str, Any]]) -> tuple[set[str], bool]:
